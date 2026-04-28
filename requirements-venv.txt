@@ -1,0 +1,16 @@
+torch==2.5.1+cu121
+torchaudio==2.5.1+cu121
+torchvision==0.20.1+cu121
+faster-whisper==1.2.1
+ctranslate2==4.7.1
+stable-ts==2.19.1
+openai-whisper==20250625
+deepl==1.16.1
+moviepy==2.2.1
+mutagen==1.47.0
+tkinterdnd2==0.4.3
+qrcode==8.2
+pywin32==306
+imageio-ffmpeg==0.6.0
+setuptools==80.9.0
+google-genai

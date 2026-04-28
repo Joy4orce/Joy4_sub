@@ -1,0 +1,89 @@
+import locale
+
+
+localize_strings = {
+    'ko_KR' : {
+        'contact' : "버그 제보 및 기타연락 : ",
+        'appname' : "Joy4_sub(영상자막자동생성및번역기)",
+        'apikey' : "API 키",
+        'generate' : "자막생성",
+        'selectfile' : "파일 열기",
+        'selectinstruction' : "파일 경로 입력(드래그 앤 드랍 가능)",
+        'sourcelangcode' : "원본 언어코드(일단 자동인식이지만 번역이 이상하면 넣어보세요.\n 언어코드 예시 : ko, en, ja, fr, zh, etc...",
+        'targetlangcode' : "타깃 언어코드(KO, EN-US, JA, FR, ZH, etc...)",
+        'choosemodel'   : "언어모델 선택",
+        'donation_paypal' : "페이팔로 후원하기",
+        'donation_patreon' : "패트론으로 구독해서 프로젝트 후원하기",
+        'donation_kakao' : "카카오페이로 커피한잔^^",
+        'original' : "원본자막도 생성(*원문.srt로 생성)",
+        'transcribed' : "원문",
+        'path' : "파일경로",
+        'size' : "크기",
+        "length" : "길이",
+        "status" : "상태",
+        'donation_account' : "후원 : 우리은행 1002-544-924007",
+        'multifile_instruction' : "아래에 파일들을 드래그 & 드랍하거나, '폴더 추가' 버튼으로 폴더 내 모든 미디어 파일을 일괄 추가하세요.",
+        'add_folder' : "폴더 추가",
+        'add_folder_dialog_title' : "음원이 들어있는 폴더 선택",
+        'add_folder_summary' : "{added}개 파일을 추가했습니다.\n(건너뜀: 중복 {duplicates}, 미지원 {unsupported})",
+        'add_folder_no_files' : "선택한 폴더에서 지원하는 미디어 파일을 찾지 못했습니다.\n\n지원 포맷: {formats}",
+        'translation_engine' : "번역 엔진",
+        'claude_apikey' : "api키(Claude)",
+        'apikey_multiline_hint' : "* Gemini/ChatGPT는 여러 키를 줄바꿈으로 구분해 입력하면 한도 초과 시 자동 전환됩니다.",
+        'api_settings_tab' : "API 설정",
+        'api_settings_intro' : "엔진별 API 키와 모델을 설정합니다. Gemini와 ChatGPT는 여러 키를 줄바꿈으로 구분해 입력하면 한도 초과 시 자동으로 다음 키로 전환됩니다.",
+        'apikey_label' : "API 키",
+        'apikey_label_multi' : "API 키\n(줄바꿈 구분)",
+        'model_label' : "모델",
+        'save_apikeys' : "저장",
+        'claude_pro_token_label' : "Pro OAuth 토큰",
+        'claude_team_token_label' : "Team OAuth 토큰",
+        'claude_default_plan_label' : "기본 플랜",
+        'claude_token_hint' : "* `claude setup-token` 명령으로 각 계정에서 토큰을 발급받아 입력하세요. 한 플랜이 한도에 도달하면 자동으로 다른 플랜으로 전환됩니다."
+    },
+    'base' : {
+        'contact': "contact : ",
+        'appname' : "Joy4_sub",
+        'apikey' : "API Key",
+        'generate' : "generate subtitle",
+        'selectfile' : "file open",
+        'selectinstruction' : "file path : (Drag & Drop enable)",
+        'sourcelangcode' : "source language code(ko, en, ja, fr, zh, etc..\n optional, autodetect it but if translation is not good",
+        'targetlangcode' : "target language code(KO, EN-US, JA, FR, ZH, etc...)",
+        'choosemodel'   : "choose translationmodel",
+        'donation_paypal' : "Support my project by Paypal",
+        'donation_patreon' : "Or you can join membership in patreon to motivate this project",
+        'donation_kakao' : "If you're Korean, Use kakaopay:)",
+        'original' : "generate transcribed srt too(*transcribed.srt)",
+        'transcribed' : "transcribed",
+        'path': "Path",
+        'size': "Size",
+        "length": "Length",
+        "status": "Status",
+        "multifile_instruction": "Drag&drop files to below box, or click 'Add Folder' to recursively import every media file in a folder.",
+        'add_folder' : "Add Folder",
+        'add_folder_dialog_title' : "Select a folder containing media files",
+        'add_folder_summary' : "Added {added} file(s).\n(Skipped: {duplicates} duplicate, {unsupported} unsupported)",
+        'add_folder_no_files' : "No supported media files were found in the selected folder.\n\nSupported formats: {formats}",
+        'translation_engine' : "Translation Engine",
+        'claude_apikey' : "api Key(Claude)",
+        'apikey_multiline_hint' : "* Gemini/ChatGPT support multiple keys separated by newlines — automatic rotation on rate limit.",
+        'api_settings_tab' : "API Settings",
+        'api_settings_intro' : "Configure API keys and models per engine. For Gemini and ChatGPT, separate multiple keys with newlines — they will rotate automatically when one is rate-limited.",
+        'apikey_label' : "API Key",
+        'apikey_label_multi' : "API Keys\n(one per line)",
+        'model_label' : "Model",
+        'save_apikeys' : "Save",
+        'claude_pro_token_label' : "Pro OAuth token",
+        'claude_team_token_label' : "Team OAuth token",
+        'claude_default_plan_label' : "Default plan",
+        'claude_token_hint' : "* Run `claude setup-token` in each account to obtain tokens. When one plan hits the rate limit, Joy4_sub automatically switches to the other."
+    }
+}
+
+
+def getstr(strcode):
+    if locale.getlocale()[0] == 'ko_KR' or locale.getlocale()[0] == 'Korean_Korea':
+        return localize_strings['ko_KR'][strcode]
+    else:
+        return localize_strings['base'][strcode]

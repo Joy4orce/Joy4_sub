@@ -1,0 +1,101 @@
+class UIwrapper:
+    def __init__(self, queue, lock, key, cuda_var, translateoption_var,
+                 srclanguagecodeinput, targetlanguagecodinput, original_var,
+                 fast_option, translation_engine="DeepL", rate_limit_wait_fn=None,
+                 deepl_key="", gemini_keys="", openai_keys="",
+                 gemini_model="", openai_model="",
+                 claude_pro_token="", claude_team_token="", claude_default_plan="pro"):
+        self.queue = queue
+        self.lock = lock
+        self.key = key  # legacy: active engine's keys (kept for compat)
+        self.cuda_var = cuda_var
+        self.translateoption_var = translateoption_var
+        self.srclanguagecodeinput = srclanguagecodeinput
+        self.targetlanguagecodinput = targetlanguagecodinput
+        self.original_var = original_var
+        self.fast_option = fast_option
+        self.translation_engine = translation_engine
+        self.rate_limit_wait_fn = rate_limit_wait_fn
+        self.deepl_key = deepl_key
+        self.gemini_keys = gemini_keys
+        self.openai_keys = openai_keys
+        self.gemini_model = gemini_model
+        self.openai_model = openai_model
+        self.claude_pro_token = claude_pro_token
+        self.claude_team_token = claude_team_token
+        self.claude_default_plan = (claude_default_plan or "pro").lower()
+
+    def update_percentagelabel_post(self, text, value):
+        with self.lock:
+            self.queue.put((text, value))
+
+    def update_progressbar(self, text, value):
+        with self.lock:
+            self.queue.put((text, value))
+
+    def getkey(self):
+        """Return the API key string for the currently active engine."""
+        engine = self.translation_engine
+        if engine == "DeepL":
+            return self.deepl_key
+        if engine == "Gemini":
+            return self.gemini_keys
+        if engine == "ChatGPT":
+            return self.openai_keys
+        return self.key  # fallback for legacy / unknown engines
+
+    def get_progressbar(self):
+        return self.progressbar
+
+    def get_percentagelabel(self):
+        return self.percentagelabel
+
+    def get_cuda_var(self):
+        return self.cuda_var
+
+    def get_translateoption_Var(self):
+        return self.translateoption_var
+
+    def get_srclanguagecodeinput(self):
+        return self.srclanguagecodeinput
+
+    def get_trglanguagecodeinput(self):
+        return self.targetlanguagecodinput
+
+    def get_original_var(self):
+        return self.original_var
+
+    def get_fast_var(self):
+        return self.fast_option
+
+    def get_translation_engine(self):
+        return self.translation_engine
+
+    def get_deepl_key(self):
+        return self.deepl_key
+
+    def get_gemini_keys(self):
+        return self.gemini_keys
+
+    def get_openai_keys(self):
+        return self.openai_keys
+
+    def get_gemini_model(self):
+        return self.gemini_model
+
+    def get_openai_model(self):
+        return self.openai_model
+
+    def get_claude_pro_token(self):
+        return self.claude_pro_token
+
+    def get_claude_team_token(self):
+        return self.claude_team_token
+
+    def get_claude_default_plan(self):
+        return self.claude_default_plan
+
+    def wait_for_rate_limit_decision(self, file_info=""):
+        if self.rate_limit_wait_fn is None:
+            return False
+        return self.rate_limit_wait_fn(file_info)
