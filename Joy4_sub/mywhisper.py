@@ -155,10 +155,11 @@ def translate_srt_file(transcribed_srt_path, translated_srt_path, uiwrapper):
         append_runtime_log(f"No subtitle lines found in {transcribed_srt_path}")
         return False
 
-    append_runtime_log(f"Submitting {len(source_lines)} subtitle lines to DeepL")
+    engine_name = uiwrapper.get_translation_engine() if hasattr(uiwrapper, 'get_translation_engine') else "DeepL"
+    append_runtime_log(f"Submitting {len(source_lines)} subtitle lines to {engine_name}")
     translated_lines = translate_subtitle_lines(source_lines, uiwrapper)
     if translated_lines is None:
-        append_runtime_log("DeepL returned no translated lines")
+        append_runtime_log(f"{engine_name} returned no translated lines")
         return False
 
     aligned_lines = align_translated_lines(timestamps, translated_lines)
