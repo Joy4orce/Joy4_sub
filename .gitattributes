@@ -1,0 +1,30 @@
+# Default behavior: normalize text files to LF on commit, restore native EOL on checkout.
+* text=auto eol=lf
+
+# --- Source code: always LF ---
+*.py    text eol=lf
+*.txt   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.cfg   text eol=lf
+*.ini   text eol=lf
+
+# --- Windows-only scripts: always CRLF (so cmd.exe parses them correctly) ---
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# --- Binary files: never touch ---
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.exe   binary
+*.dll   binary
+*.zip   binary
+*.7z    binary
+*.whl   binary
+*.pdf   binary

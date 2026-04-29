@@ -1,16 +1,32 @@
+# Joy4_sub - direct runtime dependencies
+# Used by Joy4_sub-Setup.bat to provision a working .venv-vatsg
+# Install with: pip install --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements-venv.txt
+
+# --- PyTorch (CUDA 12.1 builds) ---
 torch==2.5.1+cu121
 torchaudio==2.5.1+cu121
 torchvision==0.20.1+cu121
+
+# --- Speech-to-text ---
 faster-whisper==1.2.1
 ctranslate2==4.7.1
 stable-ts==2.19.1
 openai-whisper==20250625
+
+# --- Translation engines ---
 deepl==1.16.1
+google-genai==1.73.1
+openai==2.32.0
+
+# --- Media handling ---
 moviepy==2.2.1
 mutagen==1.47.0
+imageio-ffmpeg==0.6.0
+
+# --- UI / OS ---
 tkinterdnd2==0.4.3
 qrcode==8.2
 pywin32==306
-imageio-ffmpeg==0.6.0
+
+# --- Misc ---
 setuptools==80.9.0
-google-genai

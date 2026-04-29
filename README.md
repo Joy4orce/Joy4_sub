@@ -1,47 +1,139 @@
-# Joy4_sub(Video Automatic Transcribed to translated Subtitle Generator)
-![Untitled (1)](https://github.com/Whiw/VATSG/assets/9716884/bbd026ad-bf9b-41c5-b31f-4d454784f54a)
-Above Demovideo's source language is Korean and target language is English. 
+# Joy4_sub
 
-This is the subtitle generator(Joy4_sub) which use [moviepy](https://github.com/Zulko/moviepy) to generate mp3 and then use [faster-whisper](https://github.com/guillaumekln/faster-whisper) to get text recognition and then use deepl-api to generate your target language subtitle file(srt format)
+**Video Automatic Transcribed → translated Subtitle Generator**
 
-If you are a general user who want to view any video file and mp3 file to your language, It will provide way. 
+A Windows desktop tool that transcribes video/audio files with Whisper and translates the subtitles into your target language. Supports four translation engines, batch processing, and recursive folder import.
 
-## Setup
+> Renamed from VATSG (1.0.4). The repository now lives at [`Joy4orce/Joy4_sub`](https://github.com/Joy4orce/Joy4_sub).
 
-### Windows
+---
 
-You can download it in release tab. You can select installer version or uninstalled version which is split compressed because of size policy. I only tested windows 10, It worked well.
+## Features
+
+- **Speech-to-text** with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and [openai-whisper](https://github.com/openai/whisper) (CUDA 12.1 supported)
+- **Four translation engines**, switchable from the UI:
+  - **DeepL** (API key)
+  - **Claude Haiku** via Claude Code CLI (Pro/Team plan with automatic failover)
+  - **Google Gemini** (API key, multi-key rotation on rate limit)
+  - **OpenAI ChatGPT** (API key, multi-key rotation on rate limit)
+- **Multi-file batch mode** with progress tracking
+- **Recursive folder import**: select a folder, every supported media file inside (including sub-folders) is added automatically
+- **Drag & drop** is fully retained
+- **Rate-limit / safety-refusal handling** for Claude Haiku — automatic plan switching, batch-level fallback to original text on content-policy refusal
+- **Korean / English** localization
+
+Supported media: `.mp3 .wav .aac .m4a .flac .mp4 .mkv .mov .avi .webm .ogg .opus .wma .ts ...` (22 formats total)
+
+---
+
+## Setup (Windows)
+
+### Prerequisites
+- Windows 10 / 11
+- Python 3.10 (the setup script will offer to install it via `winget` if missing)
+- (Optional) NVIDIA GPU with CUDA 12.1 for fast Whisper transcription
+
+### One-shot install
+
+```cmd
+Joy4_sub-Setup.bat
+```
+
+This creates `.venv-vatsg/`, installs all dependencies from `requirements-venv.txt`, and offers to launch the app on completion.
+
+### Manual install
+
+```bash
+python -m venv .venv-vatsg
+.venv-vatsg\Scripts\activate
+pip install --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements-venv.txt
+python Joy4_sub\Joy4_sub.py
+```
+
+---
 
 ## Usage
-In file tab, 
-1. Write your api key(deepl) and then press file open to choose video or drag&drop your video file(mp3 file is ok too)
-2. Select model based on [faster-whisper](https://github.com/guillaumekln/faster-whisper), there are specific specs to select. choose CUDA enable or disable based on your environment.
-3. Write source and target language code. If you don't write source language code, it will automatically detect, But If translation is weird, fill that.
-4. Press generate button. I tested several window10 machine only. But it works fine.
-5. It will generate *.srt file in your video file directory.
-6. Enjoy it! At first generation, Model will be downloaded so it will take some time. 
 
-In multifile tab
-I added multifile tab and you can select files to listbox and can work it sequentially. you don't have to do it one by one. 
-Also, you can edit filelist by 'del' key. 
+### Single file tab
+1. Configure your API keys in the **API Settings** tab (DeepL / Gemini / ChatGPT / Claude Pro+Team OAuth tokens)
+2. Drop a video/audio file or click **file open**
+3. Pick a Whisper model and target language code
+4. Click **generate** → an `.srt` file is written next to the source file
 
-About Language code, please check [deepl](https://www.deepl.com/docs-api/translate-text/?utm_source=github&utm_medium=github-python-readme)
+### Multifile tab
+- Drop multiple files, **or** click **폴더 추가 / Add Folder** to recursively pull in every supported media file from a directory tree
+- Press `Delete` to remove selected items
+- Click **generate** to process the queue sequentially
 
-Also for your convenience, I made language code text files 'sourcelangcode.txt', 'targetlangcode.txt'
+### Claude Haiku translation (CLI mode)
+This project uses the official Claude Code CLI for Claude translation, not the Anthropic SDK directly. Steps:
 
-## CUDA
-Because [faster-whisper](https://github.com/guillaumekln/faster-whisper) can use CUDA, If you satisfy CUDA spec, then it will work on it. Just check CUDA and proceed it. 
+```bash
+# In a normal PowerShell:
+claude.exe login              # Authenticate the Pro account
+claude.exe setup-token        # (Optional) get an OAuth token for Team plan
+```
 
-## SUPPORT
+Paste the Pro / Team OAuth tokens into the **API Settings** tab. When one plan hits its rate limit, Joy4_sub switches to the other automatically.
 
-Since there are much more to improve things, such as not just one file, multifile automatic generation and not generate subtitle but make add subtitle to original video file.
+### Language codes
+- DeepL codes: <https://www.deepl.com/docs-api/translate-text>
+- Reference files included in the repo: `srclangcode.txt`, `targetlangcode.txt`
 
-If AI language translation model which shows good quality comes to show, I want to combine it also. Also cli support and mac/linux build and test.
+---
 
-And I have future plan to make android app to connect local program in pc to generate srt file in mobile device. 
+## Building a distributable
 
-So, I want you to support me to encourage and motivate this project!
+```cmd
+build.bat
+```
 
-[Paypal](https://paypal.me/whiw215), 
+Produces a stand-alone `dist/` folder via PyInstaller.
 
-Or you can be member to support me in [patreon](https://www.patreon.com/Whiw/membership)
+---
+
+## Project layout
+
+```
+Joy4_sub-1.0/
+├─ Joy4_sub/                 # Application source
+│  ├─ Joy4_sub.py            # Entry point + Tk UI
+│  ├─ UIwrapper.py           # State container passed to workers
+│  ├─ mywhisper.py           # Whisper / translation pipeline
+│  ├─ extractaudio.py        # Media probing (moviepy / mutagen)
+│  ├─ claudewrapper.py       # Claude Code CLI wrapper (rate-limit + safety)
+│  ├─ deeplwrapper.py        # DeepL API wrapper
+│  ├─ geminiwrapper.py       # Google Gemini wrapper (multi-key)
+│  ├─ openaiwrapper.py       # ChatGPT wrapper (multi-key)
+│  ├─ apikeyrotator.py       # Multi-key rotation logic
+│  ├─ settings.py            # Windows Credential Manager persistence
+│  ├─ localization.py        # ko_KR / en strings
+│  ├─ utility.py             # Treeview helpers, path shortening
+│  └─ worker_subprocess.py   # Out-of-process worker for batch mode
+├─ Asset/                    # Icons / images
+├─ requirements-venv.txt     # Pinned runtime dependencies
+├─ requirements.txt          # Alias of the above
+├─ Joy4_sub-Setup.bat        # First-run installer
+├─ Joy4_sub-Start.bat        # Launcher
+└─ build.bat                 # PyInstaller build script
+```
+
+User settings and runtime logs live at:
+```
+%APPDATA%\VATSG\settings.json
+%APPDATA%\VATSG\runtime.log
+```
+
+API tokens for Claude are stored encrypted in **Windows Credential Manager**.
+
+---
+
+## License
+
+See `LICENSE.txt`. Third-party licenses bundled in `licenses.txt`.
+
+---
+
+## Contact
+
+JoyForce — `powertjsl@gmail.com`
