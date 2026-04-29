@@ -167,6 +167,11 @@ translation_engine_var = tkinter.StringVar(value="DeepL")
 gemini_model_var = tkinter.StringVar(value="gemini-2.0-flash")
 openai_model_var = tkinter.StringVar(value="gpt-4o-mini")
 
+# Local LLM configuration (OpenAI-compatible: koboldcpp / LM Studio / Ollama / ...)
+local_endpoint_var = tkinter.StringVar(value="http://localhost:5001/v1")
+local_model_var = tkinter.StringVar(value="local")
+local_temperature_var = tkinter.StringVar(value="0.1")
+
 # Claude plan selection (Pro / Team) — both can be configured for auto-fallback
 claude_default_plan_var = tkinter.StringVar(value="pro")
 
@@ -222,6 +227,33 @@ def get_claude_pro_token_input():
 def get_claude_team_token_input():
     try:
         return claude_team_token_input.get().strip()
+    except Exception:
+        return ""
+
+
+def get_local_endpoint_input():
+    return (local_endpoint_var.get() or "").strip()
+
+
+def get_local_model_input():
+    return (local_model_var.get() or "").strip()
+
+
+def get_local_system_prompt_input():
+    return _get_text_widget_content(local_system_prompt_input)
+
+
+def get_local_temperature_input():
+    raw = (local_temperature_var.get() or "").strip()
+    try:
+        return float(raw) if raw else 0.1
+    except ValueError:
+        return 0.1
+
+
+def get_local_apikey_input():
+    try:
+        return local_apikey_input.get().strip()
     except Exception:
         return ""
 
@@ -451,6 +483,11 @@ def proceedfastwhisperthread():
         claude_pro_token=get_claude_pro_token_input(),
         claude_team_token=get_claude_team_token_input(),
         claude_default_plan=claude_default_plan_var.get(),
+        local_endpoint=get_local_endpoint_input(),
+        local_model=get_local_model_input(),
+        local_system_prompt=get_local_system_prompt_input(),
+        local_temperature=get_local_temperature_input(),
+        local_apikey=get_local_apikey_input(),
     )
     save_all_apikeys()
     settingjson(transferuiwrapper)
@@ -489,6 +526,11 @@ def proceed_multifile_whisperthread():
             claude_pro_token=get_claude_pro_token_input(),
             claude_team_token=get_claude_team_token_input(),
             claude_default_plan=claude_default_plan_var.get(),
+            local_endpoint=get_local_endpoint_input(),
+            local_model=get_local_model_input(),
+            local_system_prompt=get_local_system_prompt_input(),
+            local_temperature=get_local_temperature_input(),
+            local_apikey=get_local_apikey_input(),
         )
         save_all_apikeys()
         settingjson(transferuiwrapper)
@@ -518,6 +560,11 @@ def proceed_multifile_whisperthread():
                     "--claude-pro-token", get_claude_pro_token_input(),
                     "--claude-team-token", get_claude_team_token_input(),
                     "--claude-default-plan", claude_default_plan_var.get(),
+                    "--local-endpoint", get_local_endpoint_input(),
+                    "--local-model", get_local_model_input(),
+                    "--local-system-prompt", get_local_system_prompt_input(),
+                    "--local-temperature", str(get_local_temperature_input()),
+                    "--local-apikey", get_local_apikey_input(),
                 ]
                 if sourcelanguagecodeinput.get():
                     worker_args.extend(["--source-lang", sourcelanguagecodeinput.get()])
@@ -671,6 +718,19 @@ def initialize():
     saved_claude_default_plan = (settings.get("claude_default_plan", "pro") or "pro").lower()
     if saved_claude_default_plan in ("pro", "team"):
         claude_default_plan_var.set(saved_claude_default_plan)
+    saved_local_endpoint = settings.get("local_endpoint", "")
+    if saved_local_endpoint:
+        local_endpoint_var.set(saved_local_endpoint)
+    saved_local_model = settings.get("local_model", "")
+    if saved_local_model:
+        local_model_var.set(saved_local_model)
+    saved_local_system_prompt = settings.get("local_system_prompt", "")
+    if saved_local_system_prompt:
+        local_system_prompt_input.delete("1.0", "end")
+        local_system_prompt_input.insert("1.0", saved_local_system_prompt)
+    saved_local_temperature = settings.get("local_temperature", None)
+    if saved_local_temperature is not None:
+        local_temperature_var.set(str(saved_local_temperature))
 
 
 def proceed():
@@ -778,7 +838,8 @@ Radiobutton(engine_frame, text="DeepL", variable=translation_engine_var, value="
 Radiobutton(engine_frame, text="Claude Haiku", variable=translation_engine_var, value="Claude Haiku", command=lambda: on_engine_change()).grid(column=2, row=0)
 Radiobutton(engine_frame, text="Gemini", variable=translation_engine_var, value="Gemini", command=lambda: on_engine_change()).grid(column=3, row=0)
 Radiobutton(engine_frame, text="ChatGPT", variable=translation_engine_var, value="ChatGPT", command=lambda: on_engine_change()).grid(column=4, row=0)
-Label(engine_frame, text=localization.getstr('apikey_multiline_hint'), fg="#666").grid(column=0, row=1, columnspan=5, sticky='w', pady=(2, 0))
+Radiobutton(engine_frame, text="Local LLM", variable=translation_engine_var, value="Local LLM", command=lambda: on_engine_change()).grid(column=5, row=0)
+Label(engine_frame, text=localization.getstr('apikey_multiline_hint'), fg="#666").grid(column=0, row=2, columnspan=6, sticky='w', pady=(2, 0))
 
 frame3 = Frame(frame1)
 frame3.grid(column=0, row=7)
@@ -855,6 +916,35 @@ Label(claude_frame, text=localization.getstr('claude_token_hint'), fg="#666", wr
     column=0, row=3, columnspan=2, sticky='w', padx=5, pady=(0, 4))
 claude_frame.columnconfigure(1, weight=1)
 
+# Local LLM (OpenAI-compatible: koboldcpp / LM Studio / Ollama / llama.cpp / vLLM)
+local_frame = ttk.LabelFrame(api_inner, text=localization.getstr('local_llm_section'))
+local_frame.grid(column=0, row=5, sticky='ew', padx=5, pady=5)
+
+Label(local_frame, text=localization.getstr('local_endpoint_label')).grid(column=0, row=0, sticky='w', padx=5, pady=4)
+local_endpoint_input = Entry(local_frame, textvariable=local_endpoint_var, width=50)
+local_endpoint_input.grid(column=1, row=0, sticky='ew', padx=5, pady=4)
+
+Label(local_frame, text=localization.getstr('local_model_label')).grid(column=0, row=1, sticky='w', padx=5, pady=4)
+local_model_input = Entry(local_frame, textvariable=local_model_var, width=50)
+local_model_input.grid(column=1, row=1, sticky='ew', padx=5, pady=4)
+
+Label(local_frame, text=localization.getstr('local_system_prompt_label')).grid(column=0, row=2, sticky='nw', padx=5, pady=4)
+local_system_prompt_input = tkinter.Text(local_frame, width=50, height=4, wrap="word")
+local_system_prompt_input.grid(column=1, row=2, sticky='ew', padx=5, pady=4)
+local_system_prompt_input.insert("1.0", "당신은 전문 일한 번역가입니다. 주어진 일본어를 한국어로 번역하세요.")
+
+Label(local_frame, text=localization.getstr('local_temperature_label')).grid(column=0, row=3, sticky='w', padx=5, pady=4)
+local_temperature_input = Entry(local_frame, textvariable=local_temperature_var, width=10)
+local_temperature_input.grid(column=1, row=3, sticky='w', padx=5, pady=4)
+
+Label(local_frame, text=localization.getstr('local_apikey_label')).grid(column=0, row=4, sticky='w', padx=5, pady=4)
+local_apikey_input = Entry(local_frame, width=50, show="*")
+local_apikey_input.grid(column=1, row=4, sticky='ew', padx=5, pady=4)
+
+Label(local_frame, text=localization.getstr('local_llm_hint'), fg="#666", wraplength=520, justify='left').grid(
+    column=0, row=5, columnspan=2, sticky='w', padx=5, pady=(0, 4))
+local_frame.columnconfigure(1, weight=1)
+
 api_inner.columnconfigure(0, weight=1)
 
 
@@ -865,6 +955,7 @@ def save_all_apikeys():
     save_engine_apikey("openai", get_openai_keys_input())
     save_engine_apikey("claude_pro", get_claude_pro_token_input())
     save_engine_apikey("claude_team", get_claude_team_token_input())
+    save_engine_apikey("local", get_local_apikey_input())
 
 
 def load_all_apikeys():
@@ -889,6 +980,10 @@ def load_all_apikeys():
     if claude_team:
         claude_team_token_input.delete(0, "end")
         claude_team_token_input.insert(0, claude_team)
+    local_k = load_engine_apikey("local") or ""
+    if local_k:
+        local_apikey_input.delete(0, "end")
+        local_apikey_input.insert(0, local_k)
     # Migrate from legacy single key (set as DeepL by default if empty)
     if not deepl:
         legacy = load_apikey()
@@ -903,7 +998,7 @@ def load_all_apikeys():
 
 
 save_button_frame = Frame(api_inner)
-save_button_frame.grid(column=0, row=5, sticky='e', pady=(8, 0))
+save_button_frame.grid(column=0, row=6, sticky='e', pady=(8, 0))
 Button(save_button_frame, text=localization.getstr('save_apikeys'), command=save_all_apikeys).pack()
 
 tree_frame = Frame(multifileframe, width=400, height=20)

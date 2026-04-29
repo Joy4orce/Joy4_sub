@@ -39,7 +39,14 @@ localize_strings = {
         'claude_pro_token_label' : "Pro OAuth 토큰",
         'claude_team_token_label' : "Team OAuth 토큰",
         'claude_default_plan_label' : "기본 플랜",
-        'claude_token_hint' : "* `claude setup-token` 명령으로 각 계정에서 토큰을 발급받아 입력하세요. 한 플랜이 한도에 도달하면 자동으로 다른 플랜으로 전환됩니다."
+        'claude_token_hint' : "* `claude setup-token` 명령으로 각 계정에서 토큰을 발급받아 입력하세요. 한 플랜이 한도에 도달하면 자동으로 다른 플랜으로 전환됩니다.",
+        'local_llm_section' : "Local LLM (OpenAI 호환)",
+        'local_endpoint_label' : "엔드포인트 URL",
+        'local_model_label' : "모델 이름",
+        'local_system_prompt_label' : "시스템 프롬프트",
+        'local_temperature_label' : "Temperature",
+        'local_apikey_label' : "API 키 (선택)",
+        'local_llm_hint' : "* koboldcpp / LM Studio / Ollama 등 OpenAI 호환 서버를 로컬에서 실행하세요. 라인 수 보존 지시문은 자동으로 시스템 프롬프트 끝에 추가됩니다."
     },
     'base' : {
         'contact': "contact : ",
@@ -77,7 +84,14 @@ localize_strings = {
         'claude_pro_token_label' : "Pro OAuth token",
         'claude_team_token_label' : "Team OAuth token",
         'claude_default_plan_label' : "Default plan",
-        'claude_token_hint' : "* Run `claude setup-token` in each account to obtain tokens. When one plan hits the rate limit, Joy4_sub automatically switches to the other."
+        'claude_token_hint' : "* Run `claude setup-token` in each account to obtain tokens. When one plan hits the rate limit, Joy4_sub automatically switches to the other.",
+        'local_llm_section' : "Local LLM (OpenAI-compatible)",
+        'local_endpoint_label' : "Endpoint URL",
+        'local_model_label' : "Model name",
+        'local_system_prompt_label' : "System prompt",
+        'local_temperature_label' : "Temperature",
+        'local_apikey_label' : "API key (optional)",
+        'local_llm_hint' : "* Point this at any OpenAI-compatible local server (koboldcpp / LM Studio / Ollama / llama.cpp / vLLM). The line-count preservation instruction is appended to your system prompt automatically."
     }
 }
 

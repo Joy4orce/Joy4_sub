@@ -13,6 +13,7 @@ from claudewrapper import ClaudeRateLimitError, ClaudeSafetyRefusalError, transl
 from deeplwrapper import translateusingapi, translateusingapifortest
 from geminiwrapper import GeminiAllKeysExhaustedError, translateusinggemini
 from openaiwrapper import OpenAIAllKeysExhaustedError, translateusingopenai
+from localwrapper import translateusinglocal
 from extractaudio import extract_audio_for_transcription, get_media_length_in_seconds
 from settings import get_settings_path
 from utility import format_seconds
@@ -28,6 +29,8 @@ def dispatch_translate(text, uiwrapper):
         return translateusinggemini(text, uiwrapper)
     if engine == "ChatGPT":
         return translateusingopenai(text, uiwrapper)
+    if engine == "Local LLM":
+        return translateusinglocal(text, uiwrapper)
     return translateusingapi(text, uiwrapper)
 
 
