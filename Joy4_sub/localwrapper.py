@@ -150,6 +150,8 @@ def translateusinglocal(text, uiwrapper):
 
         try:
             client = OpenAI(api_key=api_key, base_url=endpoint)
+            # max_tokens=4096 prevents truncation at koboldcpp's 1024-token default,
+            # which silently produces invalid JSON for batches above ~30 lines.
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[
@@ -157,6 +159,7 @@ def translateusinglocal(text, uiwrapper):
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=temperature,
+                max_tokens=4096,
             )
             raw = (response.choices[0].message.content or "").strip()
             parsed = _parse_response(raw, len(lines))

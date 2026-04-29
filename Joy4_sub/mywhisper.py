@@ -100,7 +100,22 @@ def _translate_one_batch(batch, uiwrapper):
         return list(batch)
 
 
-def translate_subtitle_lines(lines, uiwrapper, max_bytes=20000):
+def _default_max_bytes_for_engine(uiwrapper):
+    """Cloud APIs handle 20KB batches well, but local 12B models choke on
+    that much input/output and frequently truncate. 5KB ~= 15-25 subtitle
+    lines per call, which keeps total context comfortably under 4096
+    tokens and gives the user faster per-batch progress updates."""
+    if not hasattr(uiwrapper, 'get_translation_engine'):
+        return 20000
+    engine = uiwrapper.get_translation_engine()
+    if engine == "Local LLM":
+        return 5000
+    return 20000
+
+
+def translate_subtitle_lines(lines, uiwrapper, max_bytes=None):
+    if max_bytes is None:
+        max_bytes = _default_max_bytes_for_engine(uiwrapper)
     translated_lines = []
     batch = []
     batch_size = 0
