@@ -27,6 +27,15 @@ DEFAULT_SYSTEM_PROMPT = (
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_API_KEY = "sk-local"
 
+# Maximum number of translate+verify retry attempts before giving up on a
+# batch and falling back to keeping the source lines as-is. Each retry
+# increases temperature to break out of deterministic attractor states
+# (e.g. the Gemma echo bug). 3 is a balance between catching bad output
+# and bounding the per-file slowdown — at most ~6x slower than no-verify.
+MAX_RETRY_ATTEMPTS = 3
+TEMPERATURE_BUMP_PER_ATTEMPT = 0.2
+TEMPERATURE_CEILING = 0.9
+
 # Errors that indicate "the local server isn't running" — surfaced with a
 # friendlier message so the user knows to start koboldcpp / LM Studio first.
 CONNECTION_ERROR_PATTERNS = [
@@ -102,6 +111,78 @@ def _parse_response(text, expected_count):
         except json.JSONDecodeError:
             pass
     return None
+
+
+def _attempt_translation(client, model_name, merged_prompt, temperature, expected_count):
+    """One translation API call. Returns (parsed_list, raw_text, error_text).
+
+    - parsed_list: list[str] on success, None on parse failure or API error
+    - raw_text: model's raw response (or empty on API error)
+    - error_text: short error description if API call itself failed, else ""
+    """
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": merged_prompt}],
+            temperature=temperature,
+            max_tokens=8192,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        parsed = _parse_response(raw, expected_count)
+        return parsed, raw, ""
+    except Exception as e:
+        return None, "", f"{type(e).__name__}: {e}"
+
+
+def _verify_translation(client, model_name, source_lines, translated_lines, target_lang):
+    """Ask the local model to judge whether `translated_lines` is a correct
+    translation of `source_lines` into `target_lang`.
+
+    Checks objective failure modes only — line count, target language presence,
+    untranslated source pollution. Quality / nuance judgments are deliberately
+    not asked because the same model translating and verifying biases toward
+    accepting its own (possibly wrong) output on subjective criteria.
+
+    Returns True on PASS, False on FAIL or unparseable response, or None if the
+    verification call itself raised an exception (e.g. connection drop). The
+    caller should treat None as "verification unavailable" — usually retry.
+    """
+    if len(source_lines) != len(translated_lines):
+        # Trivially fails one of our checks; no need to ask the model.
+        return False
+
+    verification_prompt = (
+        "You are a strict translation reviewer. Reply with exactly one word.\n\n"
+        f"Source ({len(source_lines)} lines):\n"
+        f"{json.dumps(source_lines, ensure_ascii=False)}\n\n"
+        f"Translation (claimed {target_lang}, {len(translated_lines)} lines):\n"
+        f"{json.dumps(translated_lines, ensure_ascii=False)}\n\n"
+        "Verify ALL of these:\n"
+        f"1. The translation has exactly {len(source_lines)} entries.\n"
+        f"2. Every non-empty entry is written in {target_lang} (not the source language).\n"
+        "3. No translated entry is identical to its corresponding source entry "
+        "(unless the source was already in the target language, e.g. proper nouns).\n"
+        "4. The general meaning is preserved.\n\n"
+        "Reply with exactly one word: PASS or FAIL. No explanation, no punctuation."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": verification_prompt}],
+            temperature=0.0,  # deterministic for binary judgment
+            max_tokens=10,
+        )
+        verdict = (response.choices[0].message.content or "").strip().upper()
+    except Exception:
+        return None  # verification call broken — caller decides what to do
+
+    # Tolerate trailing punctuation, whitespace, markdown, etc.
+    verdict_token = re.match(r'\s*\W*([A-Z]+)', verdict)
+    word = verdict_token.group(1) if verdict_token else verdict
+    if word.startswith("PASS"):
+        return True
+    return False
 
 
 def _resolve_setting(uiwrapper, getter_name, default):
@@ -193,43 +274,121 @@ def translateusinglocal(text, uiwrapper):
 
         try:
             client = OpenAI(api_key=api_key, base_url=endpoint)
-            # max_tokens=8192 gives multilingual general-purpose models room to
-            # finish the JSON array even when they add markdown fences or prose;
-            # 4096 was occasionally truncating mid-translation on Gemma E4B.
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "user", "content": merged_user_prompt},
-                ],
-                temperature=temperature,
-                max_tokens=8192,
+        except Exception as e:
+            append_runtime_log(f"Local LLM client init failed: {type(e).__name__}: {e}")
+            uiwrapper.update_percentagelabel_post("text", f"Local LLM error: {type(e).__name__}")
+            return None
+
+        # Single-line / one-shot path: skip verification (degenerate batch
+        # of size 1; verification overhead isn't worth it).
+        if single_mode:
+            parsed, raw, err = _attempt_translation(
+                client, model_name, merged_user_prompt, temperature, len(lines)
             )
-            raw = (response.choices[0].message.content or "").strip()
-            parsed = _parse_response(raw, len(lines))
+            if err:
+                if _is_connection_error(err):
+                    append_runtime_log(
+                        f"Local LLM connection refused: {err} (endpoint={endpoint})"
+                    )
+                    uiwrapper.update_percentagelabel_post(
+                        "text", "Local LLM 서버 미실행 - 엔드포인트 확인"
+                    )
+                else:
+                    append_runtime_log(f"Local LLM error: {err}")
+                    uiwrapper.update_percentagelabel_post(
+                        "text", f"Local LLM error: {err.split(':')[0]}"
+                    )
+                return None
             if parsed is None:
                 append_runtime_log(
-                    f"Local LLM parse failed (endpoint={endpoint}, model={model_name}). Raw: {raw[:200]}"
+                    f"Local LLM parse failed (single mode). Raw: {raw[:200]}"
                 )
                 uiwrapper.update_percentagelabel_post("text", "Local LLM parse error")
                 return None
-
             append_runtime_log(
-                f"Local LLM translated {len(lines)} lines via {endpoint} ({model_name})"
+                f"Local LLM translated 1 line via {endpoint} ({model_name})"
             )
-            return parsed[0] if single_mode else parsed
-        except Exception as e:
-            err_text = f"{type(e).__name__}: {e}"
-            if _is_connection_error(err_text):
+            return parsed[0]
+
+        # Batch path: translate -> verify -> retry on verification failure.
+        # Each retry bumps temperature to escape deterministic bad outputs
+        # (notably Gemma's tendency to echo source language at low temps).
+        last_attempt_lines = None
+        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+            attempt_temp = min(
+                temperature + (attempt - 1) * TEMPERATURE_BUMP_PER_ATTEMPT,
+                TEMPERATURE_CEILING,
+            )
+            uiwrapper.update_percentagelabel_post(
+                "text",
+                f"Local LLM 번역 중 ({attempt}/{MAX_RETRY_ATTEMPTS}, temp={attempt_temp:.2f})",
+            )
+            parsed, raw, err = _attempt_translation(
+                client, model_name, merged_user_prompt, attempt_temp, len(lines)
+            )
+
+            if err:
+                # API-level error: connection drops are special-cased so we
+                # don't waste retries when the server is down.
+                if _is_connection_error(err):
+                    append_runtime_log(
+                        f"Local LLM connection refused on attempt {attempt}: {err}"
+                    )
+                    uiwrapper.update_percentagelabel_post(
+                        "text", "Local LLM 서버 미실행 - 엔드포인트 확인"
+                    )
+                    return None
                 append_runtime_log(
-                    f"Local LLM connection refused: {err_text} (endpoint={endpoint})"
+                    f"Local LLM API error on attempt {attempt}: {err}"
                 )
-                uiwrapper.update_percentagelabel_post(
-                    "text", "Local LLM 서버 미실행 - 엔드포인트 확인"
+                continue  # transient — retry
+
+            if parsed is None:
+                append_runtime_log(
+                    f"Local LLM parse failed on attempt {attempt} (temp={attempt_temp:.2f}). "
+                    f"Raw: {raw[:200]}"
                 )
-                return None
-            append_runtime_log(f"Local LLM error: {err_text}")
-            uiwrapper.update_percentagelabel_post("text", f"Local LLM error: {type(e).__name__}")
-            return None
+                continue  # bad shape — retry with higher temp
+
+            # Translation got a parseable JSON array. Now verify.
+            uiwrapper.update_percentagelabel_post(
+                "text",
+                f"Local LLM 검수 중 ({attempt}/{MAX_RETRY_ATTEMPTS})",
+            )
+            verdict = _verify_translation(
+                client, model_name, lines, parsed, target_lang
+            )
+            if verdict is True:
+                append_runtime_log(
+                    f"Local LLM PASS on attempt {attempt}/{MAX_RETRY_ATTEMPTS} "
+                    f"({len(lines)} lines, temp={attempt_temp:.2f})"
+                )
+                return parsed
+            if verdict is None:
+                append_runtime_log(
+                    f"Local LLM verification call failed on attempt {attempt}; treating as FAIL"
+                )
+            else:
+                append_runtime_log(
+                    f"Local LLM FAIL verification on attempt {attempt}/{MAX_RETRY_ATTEMPTS} "
+                    f"(temp={attempt_temp:.2f}); will retry with higher temperature"
+                )
+            last_attempt_lines = parsed  # remember in case all retries exhaust
+
+        # All attempts failed verification. Returning None so mywhisper's
+        # _translate_one_batch falls back to keeping the source lines for
+        # this batch — the rest of the file still completes.
+        append_runtime_log(
+            f"Local LLM exhausted {MAX_RETRY_ATTEMPTS} attempts without passing verification "
+            f"({len(lines)} lines); batch will fall back to original text"
+        )
+        uiwrapper.update_percentagelabel_post(
+            "text", f"Local LLM 검수 {MAX_RETRY_ATTEMPTS}회 실패 - 원문 유지"
+        )
+        # We deliberately return None (not last_attempt_lines): if we couldn't
+        # verify the output, we'd rather show the source text than a bad
+        # translation that looked right structurally.
+        return None
 
     except Exception as e:
         append_runtime_log(f"Local LLM translation failed: {type(e).__name__}: {e}")
