@@ -175,6 +175,22 @@ def translateusinglocal(text, uiwrapper):
             append_runtime_log("Local LLM failed: openai package not installed")
             return None
 
+        # Merge system + user into a single user turn.
+        #
+        # Gemma 2/3/3n/4 chat templates do NOT define a system role; the
+        # OpenAI-compat layer in koboldcpp (and various local servers) may
+        # silently drop the system message when rendering through such a
+        # template, leaving the model with just the input — which then
+        # echoes the source verbatim (Gemma-class models are very prone
+        # to this on a 0.1-temperature decode).
+        #
+        # Concatenating into one user turn is the canonical workaround
+        # and is safe across providers: GPT/Claude/Llama-Instruct etc.
+        # still receive the same instructions, just without the system
+        # role wrapper. Cloud engines (OpenAI/Claude/Gemini) are not
+        # affected — they have their own wrappers that keep system role.
+        merged_user_prompt = system_prompt + "\n\n" + user_prompt
+
         try:
             client = OpenAI(api_key=api_key, base_url=endpoint)
             # max_tokens=8192 gives multilingual general-purpose models room to
@@ -183,8 +199,7 @@ def translateusinglocal(text, uiwrapper):
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
+                    {"role": "user", "content": merged_user_prompt},
                 ],
                 temperature=temperature,
                 max_tokens=8192,
