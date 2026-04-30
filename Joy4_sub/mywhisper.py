@@ -101,15 +101,16 @@ def _translate_one_batch(batch, uiwrapper):
 
 
 def _default_max_bytes_for_engine(uiwrapper):
-    """Cloud APIs handle 20KB batches well, but local 12B models choke on
-    that much input/output and frequently truncate. 5KB ~= 15-25 subtitle
-    lines per call, which keeps total context comfortably under 4096
-    tokens and gives the user faster per-batch progress updates."""
+    """Cloud APIs handle 20KB batches well. For local OpenAI-compatible
+    servers we use 10KB (~30-50 subtitle lines per call), which fits
+    comfortably under typical 8K-16K context windows used with 4-12B
+    models, halves API round trips compared to 5KB, and still keeps a
+    failed batch's "kept-as-original" damage small."""
     if not hasattr(uiwrapper, 'get_translation_engine'):
         return 20000
     engine = uiwrapper.get_translation_engine()
     if engine == "Local LLM":
-        return 5000
+        return 10000
     return 20000
 
 
