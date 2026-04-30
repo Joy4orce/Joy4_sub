@@ -88,16 +88,30 @@ def align_translated_lines(timestamps, translated_lines):
 
 
 def _translate_one_batch(batch, uiwrapper):
-    """Translate a single batch, gracefully handling Claude content-policy refusals
-    by falling back to the original (untranslated) lines so the rest of the file
-    can still complete."""
+    """Translate a single batch with engine-specific graceful fallbacks.
+
+    - Claude content-policy refusal: keep original lines for the batch.
+    - Local LLM parse failure / truncation / connection blip: also keep
+      original lines, since local models hiccup more often than cloud APIs
+      and the user generally prefers a partial translation over total
+      file failure. Cloud-API None returns still propagate as a hard
+      failure (those usually mean auth/network issues that need fixing).
+    """
     try:
-        return dispatch_translate(batch, uiwrapper)
+        result = dispatch_translate(batch, uiwrapper)
     except ClaudeSafetyRefusalError:
         append_runtime_log(
             f"Claude refused batch of {len(batch)} lines; keeping original text for those lines"
         )
         return list(batch)
+
+    if result is None and hasattr(uiwrapper, 'get_translation_engine'):
+        if uiwrapper.get_translation_engine() == "Local LLM":
+            append_runtime_log(
+                f"Local LLM failed batch of {len(batch)} lines; keeping original text for those lines"
+            )
+            return list(batch)
+    return result
 
 
 def _default_max_bytes_for_engine(uiwrapper):

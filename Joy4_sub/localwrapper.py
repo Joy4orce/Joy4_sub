@@ -55,14 +55,34 @@ def _is_connection_error(err_text):
     return any(p in low for p in CONNECTION_ERROR_PATTERNS)
 
 
-def _parse_response(text, expected_count):
-    """Identical strategy to openaiwrapper._parse_response.
+def _strip_markdown_fences(text):
+    """Strip ``` or ```json fences whether they're balanced or only-opening.
 
-    Local 12B-class models often add stray prose around the JSON; tolerate
-    that by also doing a regex fallback for the first JSON array seen.
+    Multilingual models (notably Gemma variants) like to wrap their JSON
+    output in a markdown code block — sometimes with the closing fence,
+    sometimes without (when output is truncated by max_tokens).
     """
+    cleaned = text.strip()
+    # Opening fence: ``` or ```json (with optional newline)
+    cleaned = re.sub(r'^\s*```(?:json|JSON)?\s*\n?', '', cleaned)
+    # Closing fence: ``` (anchored at end)
+    cleaned = re.sub(r'\n?\s*```\s*$', '', cleaned)
+    return cleaned.strip()
+
+
+def _parse_response(text, expected_count):
+    """Tolerant parser for local model output.
+
+    Handles four common shapes:
+      1. Raw JSON array: ["a", "b", ...]
+      2. JSON object with translations/lines/result/items field
+      3. Markdown-wrapped JSON: ```json\n[...]\n```
+      4. Prose + JSON: "Here is the translation: [...]"
+    """
+    cleaned = _strip_markdown_fences(text)
+
     try:
-        data = json.loads(text.strip())
+        data = json.loads(cleaned)
         if isinstance(data, list):
             return [str(x) for x in data]
         if isinstance(data, dict):
@@ -71,7 +91,9 @@ def _parse_response(text, expected_count):
                     return [str(x) for x in data[key]]
     except json.JSONDecodeError:
         pass
-    match = re.search(r'\[.*\]', text, re.DOTALL)
+
+    # Last-ditch: find the first balanced JSON array anywhere in the text.
+    match = re.search(r'\[.*\]', cleaned, re.DOTALL)
     if match:
         try:
             data = json.loads(match.group())
@@ -130,13 +152,18 @@ def translateusinglocal(text, uiwrapper):
         lines = [text] if single_mode else list(text)
 
         # Append the line-count guard to whatever the user provided.
-        # The guard mirrors openaiwrapper.py so _parse_response works identically.
+        # Stricter than openaiwrapper because local multilingual models (Gemma etc.)
+        # often wrap output in markdown or add prose unless explicitly forbidden.
         suffix = (
             f" Translate to {target_lang}. "
             f"Input has {len(lines)} lines, output must have exactly {len(lines)} lines. "
             "Return ONLY a JSON array of translated strings with the exact same length. "
             "Do not merge, split, add, or remove entries. "
-            "Preserve empty strings as empty strings."
+            "Preserve empty strings as empty strings. "
+            "Output ONLY the raw JSON array. "
+            "Do NOT use markdown formatting. "
+            "Do NOT wrap the output in ``` code fences. "
+            "Do NOT add explanations, prose, or any text before or after the array."
         )
         system_prompt = (user_system_prompt or DEFAULT_SYSTEM_PROMPT).rstrip() + suffix
         user_prompt = json.dumps(lines, ensure_ascii=False)
@@ -150,8 +177,9 @@ def translateusinglocal(text, uiwrapper):
 
         try:
             client = OpenAI(api_key=api_key, base_url=endpoint)
-            # max_tokens=4096 prevents truncation at koboldcpp's 1024-token default,
-            # which silently produces invalid JSON for batches above ~30 lines.
+            # max_tokens=8192 gives multilingual general-purpose models room to
+            # finish the JSON array even when they add markdown fences or prose;
+            # 4096 was occasionally truncating mid-translation on Gemma E4B.
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[
@@ -159,7 +187,7 @@ def translateusinglocal(text, uiwrapper):
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=temperature,
-                max_tokens=4096,
+                max_tokens=8192,
             )
             raw = (response.choices[0].message.content or "").strip()
             parsed = _parse_response(raw, len(lines))
