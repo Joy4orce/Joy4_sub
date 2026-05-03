@@ -140,8 +140,12 @@ def install_exception_hooks():
 
 window = TkinterDnD.Tk()
 window.title(localization.getstr('appname') + __version__ + " by whiw")
-window.geometry('1060x560')
-window.minsize(1060, 560)
+# Default size grew (1060x560 -> 1100x900) so the API Settings tab fits all
+# five engine sections without scrolling. minsize stays a bit smaller so the
+# app remains usable on 1366x768 / 1440x900 laptops; the API tab will just
+# require some scrolling-equivalent (scroll wheel on the inner content).
+window.geometry('1100x900')
+window.minsize(1060, 700)
 
 def report_tk_exception(exc_type, exc_value, exc_traceback):
     log_exception("Tkinter callback exception", exc_type, exc_value, exc_traceback)
@@ -796,7 +800,8 @@ def proceedmultifile():
 #window.dnd_bind('<<Drop>>', on_drop)
 
 notebook = ttk.Notebook(window)
-notebook.pack()
+# Fill the entire window so each tab can stretch with the user's resize.
+notebook.pack(expand=True, fill='both')
 
 frame1 = Frame(window)
 frame1.drop_target_register(DND_FILES)
@@ -1056,9 +1061,15 @@ save_button_frame = Frame(api_inner)
 save_button_frame.grid(column=0, row=6, sticky='e', pady=(8, 0))
 Button(save_button_frame, text=localization.getstr('save_apikeys'), command=save_all_apikeys).pack()
 
-tree_frame = Frame(multifileframe, width=400, height=20)
-tree_frame.grid(column=0, row=0, sticky='nsew')
-tree_frame.grid_rowconfigure(1, weight=0)
+tree_frame = Frame(multifileframe)
+tree_frame.grid(column=0, row=0, sticky='nsew', padx=8, pady=8)
+# Make the tree row absorb extra vertical space when the window grows; the
+# header (row 0) and the bottom button strip (row 2) stay at their natural
+# height. Column 0 fills horizontally for the same reason.
+tree_frame.grid_rowconfigure(1, weight=1)
+tree_frame.grid_columnconfigure(0, weight=1)
+multifileframe.grid_rowconfigure(0, weight=1)
+multifileframe.grid_columnconfigure(0, weight=1)
 
 multifile_header_frame = Frame(tree_frame)
 multifile_header_frame.grid(column=0, row=0, sticky='ew', pady=(2, 4))
@@ -1079,7 +1090,12 @@ add_folder_button = Button(
 )
 add_folder_button.grid(column=1, row=0, padx=(8, 4), sticky='e')
 
-file_treeview =ttk.Treeview(tree_frame, columns=( localization.getstr("path"), localization.getstr("size"), localization.getstr("length"),localization.getstr("status")), height=5)
+file_treeview = ttk.Treeview(
+    tree_frame,
+    columns=(localization.getstr("path"), localization.getstr("size"),
+             localization.getstr("length"), localization.getstr("status")),
+    height=22,  # was 5 — fills the larger default window proportionally
+)
 file_treeview.grid(column=0, row=1, sticky='nsew')
 
 # 각 열의 설정
@@ -1089,37 +1105,43 @@ file_treeview.heading(localization.getstr("length"), text=localization.getstr("l
 file_treeview.heading(localization.getstr("status"), text=localization.getstr("status"))
 
 file_treeview.column("#0", width=0, stretch=tkinter.NO)
-file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=400)
-file_treeview.column(localization.getstr("size"), anchor=tkinter.W, width=70)
-file_treeview.column(localization.getstr("length"), anchor=tkinter.W, width=90)
-file_treeview.column(localization.getstr("status"), anchor=tkinter.W, width=70)
+# Path column absorbs extra width when the window is wider than the default;
+# the small fixed-width columns (size / length / status) stay readable.
+file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=620, stretch=tkinter.YES)
+file_treeview.column(localization.getstr("size"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
+file_treeview.column(localization.getstr("length"), anchor=tkinter.W, width=100, stretch=tkinter.NO)
+file_treeview.column(localization.getstr("status"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
 
 
 
-# 임시 데이터 삽입
-generationframe = Frame(tree_frame, width=460)
-generationframe.grid(column=0, row=2)
-generationframe.grid_columnconfigure(1, weight=0)
+# Bottom strip: progress bar, generate button, status indicators.
+# Sits below the treeview, full-width so the contents can be centered.
+generationframe = Frame(tree_frame)
+generationframe.grid(column=0, row=2, sticky='ew', pady=(8, 4))
+generationframe.grid_columnconfigure(0, weight=1)
+generationframe.grid_columnconfigure(2, weight=1)  # right side flex for visual balance
 
 file_treeview.bind('<Delete>', on_delete_key_press)
 
-multifile_progressbar = ttk.Progressbar(generationframe, length=400, maximum=20)
-multifile_progressbar.grid(column=0, row=0, padx=(60, 90), pady=10, sticky='e')
+# Progress bar grows with the window for a clearer visual cue at all widths.
+multifile_progressbar = ttk.Progressbar(generationframe, length=500, maximum=20)
+multifile_progressbar.grid(column=1, row=0, padx=(0, 12), pady=6, sticky='ew')
 
 multifile_generation_button = Button(generationframe, text=localization.getstr('generate'), command=proceedmultifile)
-multifile_generation_button.grid(column=1, row=0,padx=(0, 80), sticky='w')
+multifile_generation_button.grid(column=2, row=0, padx=(0, 0), sticky='w')
 
 multifile_indicator_frame = Frame(generationframe)
-multifile_indicator_frame.grid(column=0, row=1)
+multifile_indicator_frame.grid(column=1, row=1, sticky='w')
+
+multifile_status_label = Label(multifile_indicator_frame, text="0%")
+multifile_status_label.grid(column=0, row=0, padx=(0, 12))
 
 multifile_list_label = Label(multifile_indicator_frame, text="0/0", anchor='w')
 multifile_list_label.grid(column=1, row=0, sticky='w')
 
-multifile_status_label = Label(multifile_indicator_frame, text = "0%")
-multifile_status_label.grid(column=0, row=0)
-
-
-Label(multifile_indicator_frame, text="JoyForce").grid(column=0, row=3, columnspan=2)
+# Footer credit, centered across the bottom of the multifile tab.
+Label(generationframe, text="JoyForce", fg="#888").grid(
+    column=0, row=2, columnspan=3, pady=(6, 0))
 
 
 initialize()
