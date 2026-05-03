@@ -818,76 +818,93 @@ notebook.add(frame1, text="File")
 notebook.add(multifileframe, text="Multifile")
 notebook.add(apisettingsframe, text=localization.getstr('api_settings_tab'))
 
-targetfileEntry = Entry(frame1, width=30)
+# File tab layout: a single centered form with right-aligned labels and
+# left-aligned inputs, padded so it fills the larger default window
+# without looking empty. Empty rows above/below the form give it
+# vertical breathing room without committing to a fixed offset.
+frame1.grid_columnconfigure(0, weight=1)
+frame1.grid_rowconfigure(0, weight=1)
+frame1.grid_rowconfigure(2, weight=1)
+
+form_frame = Frame(frame1)
+form_frame.grid(column=0, row=1, padx=24, pady=8)
+# Two-column form: labels on the left, inputs on the right. minsize keeps
+# the input column wide enough that long entries don't visually wrap.
+form_frame.grid_columnconfigure(0, weight=0, minsize=140)
+form_frame.grid_columnconfigure(1, weight=1, minsize=520)
+
+_FORM_PADX = (0, 10)
+_FORM_PADY = 5
+
+# Row 0 — file picker
+button = Button(form_frame, text=localization.getstr('selectfile'), command=open_dialog)
+button.grid(column=0, row=0, sticky='e', padx=_FORM_PADX, pady=_FORM_PADY)
+targetfileEntry = Entry(form_frame)
 targetfileEntry.insert(0, localization.getstr('selectinstruction'))
-targetfileEntry.grid(column=1, row=1)
+targetfileEntry.grid(column=1, row=0, sticky='ew', pady=_FORM_PADY)
 
-button = Button(frame1, text=localization.getstr('selectfile'), command=open_dialog)
-button.grid(column=0, row=1)
+# Row 1 — Whisper model + flags
+_model_label_box = Frame(form_frame)
+_model_label_box.grid(column=0, row=1, sticky='e', padx=_FORM_PADX, pady=_FORM_PADY)
+Label(_model_label_box, text=localization.getstr('choosemodel')).grid(column=0, row=0)
+fastoption = Checkbutton(_model_label_box, text="Fast", variable=fast_var)
+fastoption.grid(column=1, row=0, padx=(8, 0))
 
-frame4 = Frame(frame1)
-frame4.grid(column=0, row=2)
-
-label = Label(frame4, text=localization.getstr('choosemodel'))
-label.grid(column=0, row=0)
-
-fastoption = Checkbutton(frame4, text="Fast", variable=fast_var)
-fastoption.grid(column=1, row=0)
-
-frame2 = Frame(frame1)
-frame2.grid(column=1, row=2)
-
-modeldropdown = ttk.Combobox(frame2, textvariable=translateoption_var, values=trnanslateoptions)
+frame2 = Frame(form_frame)
+frame2.grid(column=1, row=1, sticky='w', pady=_FORM_PADY)
+modeldropdown = ttk.Combobox(frame2, textvariable=translateoption_var, values=trnanslateoptions, width=22)
 modeldropdown.grid(column=0, row=0)
-
 checkbox = ttk.Checkbutton(frame2, text="Cuda", variable=cuda_var)
-checkbox.grid(column=1, row=0)
+checkbox.grid(column=1, row=0, padx=(10, 0))
 
+# Row 2 — source language code
+Label(form_frame, text=localization.getstr('sourcelangcode'), justify='left'
+      ).grid(column=0, row=2, sticky='ne', padx=_FORM_PADX, pady=_FORM_PADY)
+sourcelanguagecodeinput = Entry(form_frame)
+sourcelanguagecodeinput.grid(column=1, row=2, sticky='ew', pady=_FORM_PADY)
 
+# Row 3 — target language code
+Label(form_frame, text=localization.getstr('targetlangcode')
+      ).grid(column=0, row=3, sticky='e', padx=_FORM_PADX, pady=_FORM_PADY)
+targetlanguagecodeinput = Entry(form_frame)
+targetlanguagecodeinput.grid(column=1, row=3, sticky='ew', pady=_FORM_PADY)
 
-sourcelanguagecodeinput = Entry(frame1, width=30)
-sourcelanguagecodeinput.grid(column=1, row=3)
+# Row 4 — translation engine selector (spans both columns)
+engine_frame = Frame(form_frame)
+engine_frame.grid(column=0, row=4, columnspan=2, sticky='ew', pady=(12, 0))
+Label(engine_frame, text=localization.getstr('translation_engine')
+      ).grid(column=0, row=0, padx=(0, 10))
+Radiobutton(engine_frame, text="DeepL", variable=translation_engine_var, value="DeepL",
+            command=lambda: on_engine_change()).grid(column=1, row=0, padx=2)
+Radiobutton(engine_frame, text="Claude Haiku", variable=translation_engine_var, value="Claude Haiku",
+            command=lambda: on_engine_change()).grid(column=2, row=0, padx=2)
+Radiobutton(engine_frame, text="Gemini", variable=translation_engine_var, value="Gemini",
+            command=lambda: on_engine_change()).grid(column=3, row=0, padx=2)
+Radiobutton(engine_frame, text="ChatGPT", variable=translation_engine_var, value="ChatGPT",
+            command=lambda: on_engine_change()).grid(column=4, row=0, padx=2)
+Radiobutton(engine_frame, text="Local LLM", variable=translation_engine_var, value="Local LLM",
+            command=lambda: on_engine_change()).grid(column=5, row=0, padx=2)
+Label(engine_frame, text=localization.getstr('apikey_multiline_hint'), fg="#666"
+      ).grid(column=0, row=1, columnspan=6, sticky='w', pady=(4, 0))
 
-
-label = Label(frame1, text=localization.getstr('targetlangcode'))
-label.grid(column=0, row=4)
-
-
-
-targetlanguagecodeinput = Entry(frame1, width=30)
-targetlanguagecodeinput.grid(column=1, row=4)
-
-label = Label(frame1, text=localization.getstr('sourcelangcode'))
-label.grid(column=0, row=3)
-
-
-engine_frame = Frame(frame1)
-engine_frame.grid(column=0, row=5, columnspan=2, sticky='w', padx=5)
-
-Label(engine_frame, text=localization.getstr('translation_engine')).grid(column=0, row=0, padx=(0, 10))
-Radiobutton(engine_frame, text="DeepL", variable=translation_engine_var, value="DeepL", command=lambda: on_engine_change()).grid(column=1, row=0)
-Radiobutton(engine_frame, text="Claude Haiku", variable=translation_engine_var, value="Claude Haiku", command=lambda: on_engine_change()).grid(column=2, row=0)
-Radiobutton(engine_frame, text="Gemini", variable=translation_engine_var, value="Gemini", command=lambda: on_engine_change()).grid(column=3, row=0)
-Radiobutton(engine_frame, text="ChatGPT", variable=translation_engine_var, value="ChatGPT", command=lambda: on_engine_change()).grid(column=4, row=0)
-Radiobutton(engine_frame, text="Local LLM", variable=translation_engine_var, value="Local LLM", command=lambda: on_engine_change()).grid(column=5, row=0)
-Label(engine_frame, text=localization.getstr('apikey_multiline_hint'), fg="#666").grid(column=0, row=2, columnspan=6, sticky='w', pady=(2, 0))
-
-frame3 = Frame(frame1)
-frame3.grid(column=0, row=7)
-
+# Row 5 — primary action: generate + original-too checkbox
+frame3 = Frame(form_frame)
+frame3.grid(column=0, row=5, columnspan=2, pady=(18, 4))
 proceedbutton = Button(frame3, text=localization.getstr('generate'), command=proceed)
-proceedbutton.grid(column=0, row=0)
-
+proceedbutton.grid(column=0, row=0, padx=(0, 12))
 originalcheckbox = Checkbutton(frame3, text=localization.getstr('original'), variable=original_var)
 originalcheckbox.grid(column=1, row=0)
 
-progressbar = ttk.Progressbar(frame1, length=100, maximum=20)
-progressbar.grid(column=1, row=7)
+# Row 6 — progress bar (spans both columns so it visually represents the file)
+progressbar = ttk.Progressbar(form_frame, length=400, maximum=20)
+progressbar.grid(column=0, row=6, columnspan=2, sticky='ew', pady=(10, 4))
 
-percentagelabel = Label(frame1, text="0%")
-percentagelabel.grid(column=1, row=8)
+# Row 7 — current-status text
+percentagelabel = Label(form_frame, text="0%")
+percentagelabel.grid(column=0, row=7, columnspan=2)
 
-Label(frame1, text="JoyForce").grid(column=0, row=9, columnspan=2)
+# Footer credit, anchored to the bottom of the tab.
+Label(frame1, text="JoyForce", fg="#888").grid(column=0, row=3, pady=(0, 10))
 
 
 # ============================================================
