@@ -426,6 +426,28 @@ def _collect_media_files_recursively(folder_path):
     return collected
 
 
+def _has_existing_subtitle(media_path):
+    """Return True if a translated subtitle (.srt or .vtt) already sits next
+    to this media file. The recursive folder-add flow uses this to skip
+    files that already have a finished translation, so re-importing a
+    folder doesn't re-queue work that's already done.
+
+    Two naming conventions are recognized side-by-side:
+      1. Replace-extension: video.mp3 -> video.srt / video.vtt
+      2. Append-extension:  video.mp3 -> video.mp3.srt / video.mp3.vtt
+    The append form is common for tools that preserve the source extension
+    so users can tell at a glance which media a subtitle belongs to.
+    """
+    base = os.path.splitext(media_path)[0]
+    candidates = (
+        base + ".srt",
+        base + ".vtt",
+        media_path + ".srt",
+        media_path + ".vtt",
+    )
+    return any(os.path.exists(c) for c in candidates)
+
+
 def add_folder_to_multifile():
     """Let the user pick a folder and bulk-add every supported media file inside it (recursive)."""
     folder = filedialog.askdirectory(
@@ -450,10 +472,14 @@ def add_folder_to_multifile():
     existing_paths = {os.path.normcase(os.path.abspath(p)) for p, _ in file_list}
     added = 0
     duplicates = 0
+    skipped_existing = 0
     for file_path in found_files:
         norm = os.path.normcase(os.path.abspath(file_path))
         if norm in existing_paths:
             duplicates += 1
+            continue
+        if _has_existing_subtitle(file_path):
+            skipped_existing += 1
             continue
         existing_paths.add(norm)
         add_media_file_to_list(file_path)
@@ -461,7 +487,8 @@ def add_folder_to_multifile():
 
     multifile_list_label['text'] = "0/" + str(len(file_list))
     append_runtime_log(
-        f"Added {added} files from folder (duplicates skipped: {duplicates}): {folder}"
+        f"Added {added} files from folder "
+        f"(skipped: {duplicates} duplicate, {skipped_existing} already-subtitled): {folder}"
     )
 
     messagebox.showinfo(
@@ -469,6 +496,7 @@ def add_folder_to_multifile():
         localization.getstr('add_folder_summary').format(
             added=added,
             duplicates=duplicates,
+            skipped_existing=skipped_existing,
             unsupported=0,
         ),
     )
