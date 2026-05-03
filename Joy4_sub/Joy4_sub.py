@@ -140,11 +140,13 @@ def install_exception_hooks():
 
 window = TkinterDnD.Tk()
 window.title(localization.getstr('appname') + __version__ + " by whiw")
-# Default size grew (1060x560 -> 1100x900) so the API Settings tab fits all
-# five engine sections without scrolling. minsize stays a bit smaller so the
-# app remains usable on 1366x768 / 1440x900 laptops; the API tab will just
-# require some scrolling-equivalent (scroll wheel on the inner content).
-window.geometry('1100x900')
+# Default size grew (1060x560 -> 1100x1000) to fit all five API Settings
+# engine sections without clipping. The Local LLM frame (endpoint, model,
+# 4-line system prompt, temperature, API key, preset toolbar, hint) is
+# roughly 280px tall on its own; the previous 900px default was still
+# cutting off the bottom of that section on standard DPI. minsize stays
+# smaller so the app still launches on 1366x768 / 1440x900 laptops.
+window.geometry('1100x1000')
 window.minsize(1060, 700)
 
 def report_tk_exception(exc_type, exc_value, exc_traceback):
