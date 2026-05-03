@@ -13,6 +13,7 @@ from claudewrapper import ClaudeRateLimitError, ClaudeSafetyRefusalError, transl
 from deeplwrapper import translateusingapi, translateusingapifortest
 from geminiwrapper import GeminiAllKeysExhaustedError, translateusinggemini
 from openaiwrapper import OpenAIAllKeysExhaustedError, translateusingopenai
+from localwrapper import translateusinglocal
 from extractaudio import extract_audio_for_transcription, get_media_length_in_seconds
 from settings import get_settings_path
 from utility import format_seconds
@@ -28,6 +29,8 @@ def dispatch_translate(text, uiwrapper):
         return translateusinggemini(text, uiwrapper)
     if engine == "ChatGPT":
         return translateusingopenai(text, uiwrapper)
+    if engine == "Local LLM":
+        return translateusinglocal(text, uiwrapper)
     return translateusingapi(text, uiwrapper)
 
 
@@ -85,19 +88,49 @@ def align_translated_lines(timestamps, translated_lines):
 
 
 def _translate_one_batch(batch, uiwrapper):
-    """Translate a single batch, gracefully handling Claude content-policy refusals
-    by falling back to the original (untranslated) lines so the rest of the file
-    can still complete."""
+    """Translate a single batch with engine-specific graceful fallbacks.
+
+    - Claude content-policy refusal: keep original lines for the batch.
+    - Local LLM parse failure / truncation / connection blip: also keep
+      original lines, since local models hiccup more often than cloud APIs
+      and the user generally prefers a partial translation over total
+      file failure. Cloud-API None returns still propagate as a hard
+      failure (those usually mean auth/network issues that need fixing).
+    """
     try:
-        return dispatch_translate(batch, uiwrapper)
+        result = dispatch_translate(batch, uiwrapper)
     except ClaudeSafetyRefusalError:
         append_runtime_log(
             f"Claude refused batch of {len(batch)} lines; keeping original text for those lines"
         )
         return list(batch)
 
+    if result is None and hasattr(uiwrapper, 'get_translation_engine'):
+        if uiwrapper.get_translation_engine() == "Local LLM":
+            append_runtime_log(
+                f"Local LLM failed batch of {len(batch)} lines; keeping original text for those lines"
+            )
+            return list(batch)
+    return result
 
-def translate_subtitle_lines(lines, uiwrapper, max_bytes=20000):
+
+def _default_max_bytes_for_engine(uiwrapper):
+    """Cloud APIs handle 20KB batches well. For local OpenAI-compatible
+    servers we use 10KB (~30-50 subtitle lines per call), which fits
+    comfortably under typical 8K-16K context windows used with 4-12B
+    models, halves API round trips compared to 5KB, and still keeps a
+    failed batch's "kept-as-original" damage small."""
+    if not hasattr(uiwrapper, 'get_translation_engine'):
+        return 20000
+    engine = uiwrapper.get_translation_engine()
+    if engine == "Local LLM":
+        return 10000
+    return 20000
+
+
+def translate_subtitle_lines(lines, uiwrapper, max_bytes=None):
+    if max_bytes is None:
+        max_bytes = _default_max_bytes_for_engine(uiwrapper)
     translated_lines = []
     batch = []
     batch_size = 0
@@ -152,10 +185,11 @@ def translate_srt_file(transcribed_srt_path, translated_srt_path, uiwrapper):
         append_runtime_log(f"No subtitle lines found in {transcribed_srt_path}")
         return False
 
-    append_runtime_log(f"Submitting {len(source_lines)} subtitle lines to DeepL")
+    engine_name = uiwrapper.get_translation_engine() if hasattr(uiwrapper, 'get_translation_engine') else "DeepL"
+    append_runtime_log(f"Submitting {len(source_lines)} subtitle lines to {engine_name}")
     translated_lines = translate_subtitle_lines(source_lines, uiwrapper)
     if translated_lines is None:
-        append_runtime_log("DeepL returned no translated lines")
+        append_runtime_log(f"{engine_name} returned no translated lines")
         return False
 
     aligned_lines = align_translated_lines(timestamps, translated_lines)

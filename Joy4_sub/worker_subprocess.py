@@ -17,7 +17,9 @@ class WorkerUIWrapper:
                  keep_original, fast_mode, translation_engine="DeepL",
                  deepl_key="", gemini_keys="", openai_keys="",
                  gemini_model="", openai_model="",
-                 claude_pro_token="", claude_team_token="", claude_default_plan="pro"):
+                 claude_pro_token="", claude_team_token="", claude_default_plan="pro",
+                 local_endpoint="", local_model="", local_system_prompt="",
+                 local_temperature=0.1, local_apikey=""):
         self.api_key = api_key  # legacy
         self.cuda_enabled = cuda_enabled
         self.model_name = model_name
@@ -34,6 +36,11 @@ class WorkerUIWrapper:
         self.claude_pro_token = claude_pro_token
         self.claude_team_token = claude_team_token
         self.claude_default_plan = (claude_default_plan or "pro").lower()
+        self.local_endpoint = local_endpoint
+        self.local_model = local_model
+        self.local_system_prompt = local_system_prompt
+        self.local_temperature = local_temperature
+        self.local_apikey = local_apikey
 
     def update_percentagelabel_post(self, text, value):
         append_runtime_log(f"Worker progress text={text} value={value}")
@@ -49,6 +56,8 @@ class WorkerUIWrapper:
             return self.gemini_keys
         if engine == "ChatGPT":
             return self.openai_keys
+        if engine == "Local LLM":
+            return self.local_apikey
         return self.api_key
 
     def get_cuda_var(self):
@@ -96,6 +105,21 @@ class WorkerUIWrapper:
     def get_claude_default_plan(self):
         return self.claude_default_plan
 
+    def get_local_endpoint(self):
+        return self.local_endpoint
+
+    def get_local_model(self):
+        return self.local_model
+
+    def get_local_system_prompt(self):
+        return self.local_system_prompt
+
+    def get_local_temperature(self):
+        return self.local_temperature
+
+    def get_local_apikey(self):
+        return self.local_apikey
+
     def wait_for_rate_limit_decision(self, file_info=""):
         append_runtime_log(f"Worker subprocess: rate limit reached, signaling parent via exit code 2")
         return False
@@ -121,12 +145,22 @@ def parse_args():
     parser.add_argument("--claude-pro-token", default="")
     parser.add_argument("--claude-team-token", default="")
     parser.add_argument("--claude-default-plan", default="pro")
+    parser.add_argument("--local-endpoint", default="")
+    parser.add_argument("--local-model", default="")
+    parser.add_argument("--local-system-prompt", default="")
+    parser.add_argument("--local-temperature", default="0.1")
+    parser.add_argument("--local-apikey", default="")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     append_runtime_log(f"Worker subprocess started for {args.file}")
+    try:
+        local_temp = float(args.local_temperature)
+    except (TypeError, ValueError):
+        local_temp = 0.1
+
     uiwrapper = WorkerUIWrapper(
         api_key=args.api_key,
         cuda_enabled=args.cuda,
@@ -144,6 +178,11 @@ def main():
         claude_pro_token=args.claude_pro_token,
         claude_team_token=args.claude_team_token,
         claude_default_plan=args.claude_default_plan,
+        local_endpoint=args.local_endpoint,
+        local_model=args.local_model,
+        local_system_prompt=args.local_system_prompt,
+        local_temperature=local_temp,
+        local_apikey=args.local_apikey,
     )
 
     try:

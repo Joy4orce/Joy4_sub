@@ -2,7 +2,7 @@
 
 **Video Automatic Transcribed → translated Subtitle Generator**
 
-A Windows desktop tool that transcribes video/audio files with Whisper and translates the subtitles into your target language. Supports four translation engines, batch processing, and recursive folder import.
+A Windows desktop tool that transcribes video/audio files with Whisper and translates the subtitles into your target language. Supports five translation engines (cloud + local), batch processing, and recursive folder import.
 
 > Renamed from VATSG (1.0.4). The repository now lives at [`Joy4orce/Joy4_sub`](https://github.com/Joy4orce/Joy4_sub).
 
@@ -11,11 +11,12 @@ A Windows desktop tool that transcribes video/audio files with Whisper and trans
 ## Features
 
 - **Speech-to-text** with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and [openai-whisper](https://github.com/openai/whisper) (CUDA 12.1 supported)
-- **Four translation engines**, switchable from the UI:
+- **Five translation engines**, switchable from the UI:
   - **DeepL** (API key)
   - **Claude Haiku** via Claude Code CLI (Pro/Team plan with automatic failover)
   - **Google Gemini** (API key, multi-key rotation on rate limit)
   - **OpenAI ChatGPT** (API key, multi-key rotation on rate limit)
+  - **Local LLM** — any OpenAI-compatible local server (koboldcpp / LM Studio / Ollama / llama.cpp / vLLM). Configure endpoint URL, model name, system prompt, and temperature from the UI
 - **Multi-file batch mode** with progress tracking
 - **Recursive folder import**: select a folder, every supported media file inside (including sub-folders) is added automatically
 - **Drag & drop** is fully retained
@@ -75,6 +76,26 @@ claude.exe setup-token        # (Optional) get an OAuth token for Team plan
 ```
 
 Paste the Pro / Team OAuth tokens into the **API Settings** tab. When one plan hits its rate limit, Joy4_sub switches to the other automatically.
+
+### Local LLM (OpenAI-compatible server)
+Any local inference server that exposes an OpenAI-compatible `/v1/chat/completions` endpoint works:
+
+- [koboldcpp](https://github.com/LostRuins/koboldcpp) — easiest for GGUF models, single-binary
+- [LM Studio](https://lmstudio.ai/) — GUI launcher with OpenAI server mode
+- [Ollama](https://ollama.com/) — `ollama serve` exposes `:11434/v1`
+- [llama.cpp](https://github.com/ggerganov/llama.cpp) — `llama-server`
+- [vLLM](https://github.com/vllm-project/vllm) — high-throughput, GPU-only
+
+Verified to work with translation-tuned models such as **`ja-ko-vn-12b`** (Japanese→Korean specialist) and general multilingual models such as **Gemma 3 / 3n / 4** variants.
+
+Configure from the **API Settings** tab:
+- **Endpoint URL** (default `http://localhost:5001/v1` for koboldcpp)
+- **Model name** (most servers ignore this; "local" works as placeholder)
+- **System prompt** — the line-count preservation instruction is appended automatically
+- **Temperature** — start at `0.1` for deterministic translation
+- **API key** — most local servers ignore it; leave blank to fall back to `sk-local`
+
+The wrapper sends batches of ~10KB / ~30-50 lines at a time, so a 4K-token context is the practical minimum and 8K-16K is recommended.
 
 ### Language codes
 - DeepL codes: <https://www.deepl.com/docs-api/translate-text>

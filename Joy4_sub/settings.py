@@ -35,6 +35,7 @@ _ENGINE_TARGET = {
     "openai": "Joy4_sub_openai_apikey",
     "claude_pro": "Joy4_sub_claude_pro_token",
     "claude_team": "Joy4_sub_claude_team_token",
+    "local": "Joy4_sub_local_apikey",
 }
 
 # Mapping from current TargetName -> legacy TargetName (used for one-time migration).
@@ -206,6 +207,10 @@ def settingjson(uiwrapper):
         "gemini_model": getattr(uiwrapper, 'gemini_model', '') or '',
         "openai_model": getattr(uiwrapper, 'openai_model', '') or '',
         "claude_default_plan": getattr(uiwrapper, 'claude_default_plan', 'pro') or 'pro',
+        "local_endpoint": getattr(uiwrapper, 'local_endpoint', '') or '',
+        "local_model": getattr(uiwrapper, 'local_model', '') or '',
+        "local_system_prompt": getattr(uiwrapper, 'local_system_prompt', '') or '',
+        "local_temperature": getattr(uiwrapper, 'local_temperature', 0.1),
     }
     with open(get_settings_path(), "w", encoding="utf-8") as f:
         json.dump(settings, f)

@@ -4,7 +4,9 @@ class UIwrapper:
                  fast_option, translation_engine="DeepL", rate_limit_wait_fn=None,
                  deepl_key="", gemini_keys="", openai_keys="",
                  gemini_model="", openai_model="",
-                 claude_pro_token="", claude_team_token="", claude_default_plan="pro"):
+                 claude_pro_token="", claude_team_token="", claude_default_plan="pro",
+                 local_endpoint="", local_model="", local_system_prompt="",
+                 local_temperature=0.1, local_apikey=""):
         self.queue = queue
         self.lock = lock
         self.key = key  # legacy: active engine's keys (kept for compat)
@@ -24,6 +26,11 @@ class UIwrapper:
         self.claude_pro_token = claude_pro_token
         self.claude_team_token = claude_team_token
         self.claude_default_plan = (claude_default_plan or "pro").lower()
+        self.local_endpoint = local_endpoint
+        self.local_model = local_model
+        self.local_system_prompt = local_system_prompt
+        self.local_temperature = local_temperature
+        self.local_apikey = local_apikey
 
     def update_percentagelabel_post(self, text, value):
         with self.lock:
@@ -42,6 +49,8 @@ class UIwrapper:
             return self.gemini_keys
         if engine == "ChatGPT":
             return self.openai_keys
+        if engine == "Local LLM":
+            return self.local_apikey
         return self.key  # fallback for legacy / unknown engines
 
     def get_progressbar(self):
@@ -94,6 +103,21 @@ class UIwrapper:
 
     def get_claude_default_plan(self):
         return self.claude_default_plan
+
+    def get_local_endpoint(self):
+        return self.local_endpoint
+
+    def get_local_model(self):
+        return self.local_model
+
+    def get_local_system_prompt(self):
+        return self.local_system_prompt
+
+    def get_local_temperature(self):
+        return self.local_temperature
+
+    def get_local_apikey(self):
+        return self.local_apikey
 
     def wait_for_rate_limit_decision(self, file_info=""):
         if self.rate_limit_wait_fn is None:

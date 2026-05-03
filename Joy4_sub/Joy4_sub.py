@@ -140,8 +140,14 @@ def install_exception_hooks():
 
 window = TkinterDnD.Tk()
 window.title(localization.getstr('appname') + __version__ + " by whiw")
-window.geometry('1060x560')
-window.minsize(1060, 560)
+# Default size grew (1060x560 -> 1100x1000) to fit all five API Settings
+# engine sections without clipping. The Local LLM frame (endpoint, model,
+# 4-line system prompt, temperature, API key, preset toolbar, hint) is
+# roughly 280px tall on its own; the previous 900px default was still
+# cutting off the bottom of that section on standard DPI. minsize stays
+# smaller so the app still launches on 1366x768 / 1440x900 laptops.
+window.geometry('1100x1000')
+window.minsize(1060, 700)
 
 def report_tk_exception(exc_type, exc_value, exc_traceback):
     log_exception("Tkinter callback exception", exc_type, exc_value, exc_traceback)
@@ -167,6 +173,11 @@ translation_engine_var = tkinter.StringVar(value="DeepL")
 gemini_model_var = tkinter.StringVar(value="gemini-2.0-flash")
 openai_model_var = tkinter.StringVar(value="gpt-4o-mini")
 
+# Local LLM configuration (OpenAI-compatible: koboldcpp / LM Studio / Ollama / ...)
+local_endpoint_var = tkinter.StringVar(value="http://localhost:5001/v1")
+local_model_var = tkinter.StringVar(value="local")
+local_temperature_var = tkinter.StringVar(value="0.1")
+
 # Claude plan selection (Pro / Team) — both can be configured for auto-fallback
 claude_default_plan_var = tkinter.StringVar(value="pro")
 
@@ -184,6 +195,32 @@ OPENAI_MODEL_OPTIONS = [
     "gpt-4.1",                # expensive
     "gpt-4o",                 # expensive, best quality
 ]
+
+# Local LLM presets — quick fill for known model archetypes. Endpoint URL
+# and API key are intentionally NOT touched; those are environment-specific
+# and the user maintains them. Only the per-model behavior (system prompt,
+# temperature, model label) is filled.
+LOCAL_LLM_PRESETS = {
+    "ja_ko_vn_12b": {
+        "label_key": "local_preset_jakovn",
+        "model": "ja-ko-vn-12b-v2",
+        "temperature": "0.1",
+        "system_prompt": (
+            "당신은 전문 일한 번역가입니다. "
+            "주어진 일본어를 한국어로 번역하세요."
+        ),
+    },
+    "gemma4_uncensored": {
+        "label_key": "local_preset_gemma4",
+        "model": "Gemma-4-E4B-Uncensored",
+        "temperature": "0.3",
+        "system_prompt": (
+            "당신은 전문 자막 번역가입니다. 주어진 본문을 직역 위주로 자연스러운 한국어로 옮기세요. "
+            "설명, 주석, 사족, 메타 텍스트는 절대 추가하지 마세요. "
+            "원문 외의 내용은 출력하지 마세요."
+        ),
+    },
+}
 
 
 def _get_text_widget_content(widget):
@@ -222,6 +259,33 @@ def get_claude_pro_token_input():
 def get_claude_team_token_input():
     try:
         return claude_team_token_input.get().strip()
+    except Exception:
+        return ""
+
+
+def get_local_endpoint_input():
+    return (local_endpoint_var.get() or "").strip()
+
+
+def get_local_model_input():
+    return (local_model_var.get() or "").strip()
+
+
+def get_local_system_prompt_input():
+    return _get_text_widget_content(local_system_prompt_input)
+
+
+def get_local_temperature_input():
+    raw = (local_temperature_var.get() or "").strip()
+    try:
+        return float(raw) if raw else 0.1
+    except ValueError:
+        return 0.1
+
+
+def get_local_apikey_input():
+    try:
+        return local_apikey_input.get().strip()
     except Exception:
         return ""
 
@@ -451,6 +515,11 @@ def proceedfastwhisperthread():
         claude_pro_token=get_claude_pro_token_input(),
         claude_team_token=get_claude_team_token_input(),
         claude_default_plan=claude_default_plan_var.get(),
+        local_endpoint=get_local_endpoint_input(),
+        local_model=get_local_model_input(),
+        local_system_prompt=get_local_system_prompt_input(),
+        local_temperature=get_local_temperature_input(),
+        local_apikey=get_local_apikey_input(),
     )
     save_all_apikeys()
     settingjson(transferuiwrapper)
@@ -489,6 +558,11 @@ def proceed_multifile_whisperthread():
             claude_pro_token=get_claude_pro_token_input(),
             claude_team_token=get_claude_team_token_input(),
             claude_default_plan=claude_default_plan_var.get(),
+            local_endpoint=get_local_endpoint_input(),
+            local_model=get_local_model_input(),
+            local_system_prompt=get_local_system_prompt_input(),
+            local_temperature=get_local_temperature_input(),
+            local_apikey=get_local_apikey_input(),
         )
         save_all_apikeys()
         settingjson(transferuiwrapper)
@@ -518,6 +592,11 @@ def proceed_multifile_whisperthread():
                     "--claude-pro-token", get_claude_pro_token_input(),
                     "--claude-team-token", get_claude_team_token_input(),
                     "--claude-default-plan", claude_default_plan_var.get(),
+                    "--local-endpoint", get_local_endpoint_input(),
+                    "--local-model", get_local_model_input(),
+                    "--local-system-prompt", get_local_system_prompt_input(),
+                    "--local-temperature", str(get_local_temperature_input()),
+                    "--local-apikey", get_local_apikey_input(),
                 ]
                 if sourcelanguagecodeinput.get():
                     worker_args.extend(["--source-lang", sourcelanguagecodeinput.get()])
@@ -671,6 +750,19 @@ def initialize():
     saved_claude_default_plan = (settings.get("claude_default_plan", "pro") or "pro").lower()
     if saved_claude_default_plan in ("pro", "team"):
         claude_default_plan_var.set(saved_claude_default_plan)
+    saved_local_endpoint = settings.get("local_endpoint", "")
+    if saved_local_endpoint:
+        local_endpoint_var.set(saved_local_endpoint)
+    saved_local_model = settings.get("local_model", "")
+    if saved_local_model:
+        local_model_var.set(saved_local_model)
+    saved_local_system_prompt = settings.get("local_system_prompt", "")
+    if saved_local_system_prompt:
+        local_system_prompt_input.delete("1.0", "end")
+        local_system_prompt_input.insert("1.0", saved_local_system_prompt)
+    saved_local_temperature = settings.get("local_temperature", None)
+    if saved_local_temperature is not None:
+        local_temperature_var.set(str(saved_local_temperature))
 
 
 def proceed():
@@ -710,7 +802,8 @@ def proceedmultifile():
 #window.dnd_bind('<<Drop>>', on_drop)
 
 notebook = ttk.Notebook(window)
-notebook.pack()
+# Fill the entire window so each tab can stretch with the user's resize.
+notebook.pack(expand=True, fill='both')
 
 frame1 = Frame(window)
 frame1.drop_target_register(DND_FILES)
@@ -727,75 +820,93 @@ notebook.add(frame1, text="File")
 notebook.add(multifileframe, text="Multifile")
 notebook.add(apisettingsframe, text=localization.getstr('api_settings_tab'))
 
-targetfileEntry = Entry(frame1, width=30)
+# File tab layout: a single centered form with right-aligned labels and
+# left-aligned inputs, padded so it fills the larger default window
+# without looking empty. Empty rows above/below the form give it
+# vertical breathing room without committing to a fixed offset.
+frame1.grid_columnconfigure(0, weight=1)
+frame1.grid_rowconfigure(0, weight=1)
+frame1.grid_rowconfigure(2, weight=1)
+
+form_frame = Frame(frame1)
+form_frame.grid(column=0, row=1, padx=24, pady=8)
+# Two-column form: labels on the left, inputs on the right. minsize keeps
+# the input column wide enough that long entries don't visually wrap.
+form_frame.grid_columnconfigure(0, weight=0, minsize=140)
+form_frame.grid_columnconfigure(1, weight=1, minsize=520)
+
+_FORM_PADX = (0, 10)
+_FORM_PADY = 5
+
+# Row 0 — file picker
+button = Button(form_frame, text=localization.getstr('selectfile'), command=open_dialog)
+button.grid(column=0, row=0, sticky='e', padx=_FORM_PADX, pady=_FORM_PADY)
+targetfileEntry = Entry(form_frame)
 targetfileEntry.insert(0, localization.getstr('selectinstruction'))
-targetfileEntry.grid(column=1, row=1)
+targetfileEntry.grid(column=1, row=0, sticky='ew', pady=_FORM_PADY)
 
-button = Button(frame1, text=localization.getstr('selectfile'), command=open_dialog)
-button.grid(column=0, row=1)
+# Row 1 — Whisper model + flags
+_model_label_box = Frame(form_frame)
+_model_label_box.grid(column=0, row=1, sticky='e', padx=_FORM_PADX, pady=_FORM_PADY)
+Label(_model_label_box, text=localization.getstr('choosemodel')).grid(column=0, row=0)
+fastoption = Checkbutton(_model_label_box, text="Fast", variable=fast_var)
+fastoption.grid(column=1, row=0, padx=(8, 0))
 
-frame4 = Frame(frame1)
-frame4.grid(column=0, row=2)
-
-label = Label(frame4, text=localization.getstr('choosemodel'))
-label.grid(column=0, row=0)
-
-fastoption = Checkbutton(frame4, text="Fast", variable=fast_var)
-fastoption.grid(column=1, row=0)
-
-frame2 = Frame(frame1)
-frame2.grid(column=1, row=2)
-
-modeldropdown = ttk.Combobox(frame2, textvariable=translateoption_var, values=trnanslateoptions)
+frame2 = Frame(form_frame)
+frame2.grid(column=1, row=1, sticky='w', pady=_FORM_PADY)
+modeldropdown = ttk.Combobox(frame2, textvariable=translateoption_var, values=trnanslateoptions, width=22)
 modeldropdown.grid(column=0, row=0)
-
 checkbox = ttk.Checkbutton(frame2, text="Cuda", variable=cuda_var)
-checkbox.grid(column=1, row=0)
+checkbox.grid(column=1, row=0, padx=(10, 0))
 
+# Row 2 — source language code
+Label(form_frame, text=localization.getstr('sourcelangcode'), justify='left'
+      ).grid(column=0, row=2, sticky='ne', padx=_FORM_PADX, pady=_FORM_PADY)
+sourcelanguagecodeinput = Entry(form_frame)
+sourcelanguagecodeinput.grid(column=1, row=2, sticky='ew', pady=_FORM_PADY)
 
+# Row 3 — target language code
+Label(form_frame, text=localization.getstr('targetlangcode')
+      ).grid(column=0, row=3, sticky='e', padx=_FORM_PADX, pady=_FORM_PADY)
+targetlanguagecodeinput = Entry(form_frame)
+targetlanguagecodeinput.grid(column=1, row=3, sticky='ew', pady=_FORM_PADY)
 
-sourcelanguagecodeinput = Entry(frame1, width=30)
-sourcelanguagecodeinput.grid(column=1, row=3)
+# Row 4 — translation engine selector (spans both columns)
+engine_frame = Frame(form_frame)
+engine_frame.grid(column=0, row=4, columnspan=2, sticky='ew', pady=(12, 0))
+Label(engine_frame, text=localization.getstr('translation_engine')
+      ).grid(column=0, row=0, padx=(0, 10))
+Radiobutton(engine_frame, text="DeepL", variable=translation_engine_var, value="DeepL",
+            command=lambda: on_engine_change()).grid(column=1, row=0, padx=2)
+Radiobutton(engine_frame, text="Claude Haiku", variable=translation_engine_var, value="Claude Haiku",
+            command=lambda: on_engine_change()).grid(column=2, row=0, padx=2)
+Radiobutton(engine_frame, text="Gemini", variable=translation_engine_var, value="Gemini",
+            command=lambda: on_engine_change()).grid(column=3, row=0, padx=2)
+Radiobutton(engine_frame, text="ChatGPT", variable=translation_engine_var, value="ChatGPT",
+            command=lambda: on_engine_change()).grid(column=4, row=0, padx=2)
+Radiobutton(engine_frame, text="Local LLM", variable=translation_engine_var, value="Local LLM",
+            command=lambda: on_engine_change()).grid(column=5, row=0, padx=2)
+Label(engine_frame, text=localization.getstr('apikey_multiline_hint'), fg="#666"
+      ).grid(column=0, row=1, columnspan=6, sticky='w', pady=(4, 0))
 
-
-label = Label(frame1, text=localization.getstr('targetlangcode'))
-label.grid(column=0, row=4)
-
-
-
-targetlanguagecodeinput = Entry(frame1, width=30)
-targetlanguagecodeinput.grid(column=1, row=4)
-
-label = Label(frame1, text=localization.getstr('sourcelangcode'))
-label.grid(column=0, row=3)
-
-
-engine_frame = Frame(frame1)
-engine_frame.grid(column=0, row=5, columnspan=2, sticky='w', padx=5)
-
-Label(engine_frame, text=localization.getstr('translation_engine')).grid(column=0, row=0, padx=(0, 10))
-Radiobutton(engine_frame, text="DeepL", variable=translation_engine_var, value="DeepL", command=lambda: on_engine_change()).grid(column=1, row=0)
-Radiobutton(engine_frame, text="Claude Haiku", variable=translation_engine_var, value="Claude Haiku", command=lambda: on_engine_change()).grid(column=2, row=0)
-Radiobutton(engine_frame, text="Gemini", variable=translation_engine_var, value="Gemini", command=lambda: on_engine_change()).grid(column=3, row=0)
-Radiobutton(engine_frame, text="ChatGPT", variable=translation_engine_var, value="ChatGPT", command=lambda: on_engine_change()).grid(column=4, row=0)
-Label(engine_frame, text=localization.getstr('apikey_multiline_hint'), fg="#666").grid(column=0, row=1, columnspan=5, sticky='w', pady=(2, 0))
-
-frame3 = Frame(frame1)
-frame3.grid(column=0, row=7)
-
+# Row 5 — primary action: generate + original-too checkbox
+frame3 = Frame(form_frame)
+frame3.grid(column=0, row=5, columnspan=2, pady=(18, 4))
 proceedbutton = Button(frame3, text=localization.getstr('generate'), command=proceed)
-proceedbutton.grid(column=0, row=0)
-
+proceedbutton.grid(column=0, row=0, padx=(0, 12))
 originalcheckbox = Checkbutton(frame3, text=localization.getstr('original'), variable=original_var)
 originalcheckbox.grid(column=1, row=0)
 
-progressbar = ttk.Progressbar(frame1, length=100, maximum=20)
-progressbar.grid(column=1, row=7)
+# Row 6 — progress bar (spans both columns so it visually represents the file)
+progressbar = ttk.Progressbar(form_frame, length=400, maximum=20)
+progressbar.grid(column=0, row=6, columnspan=2, sticky='ew', pady=(10, 4))
 
-percentagelabel = Label(frame1, text="0%")
-percentagelabel.grid(column=1, row=8)
+# Row 7 — current-status text
+percentagelabel = Label(form_frame, text="0%")
+percentagelabel.grid(column=0, row=7, columnspan=2)
 
-Label(frame1, text="JoyForce").grid(column=0, row=9, columnspan=2)
+# Footer credit, anchored to the bottom of the tab.
+Label(frame1, text="JoyForce", fg="#888").grid(column=0, row=3, pady=(0, 10))
 
 
 # ============================================================
@@ -855,6 +966,64 @@ Label(claude_frame, text=localization.getstr('claude_token_hint'), fg="#666", wr
     column=0, row=3, columnspan=2, sticky='w', padx=5, pady=(0, 4))
 claude_frame.columnconfigure(1, weight=1)
 
+# Local LLM (OpenAI-compatible: koboldcpp / LM Studio / Ollama / llama.cpp / vLLM)
+local_frame = ttk.LabelFrame(api_inner, text=localization.getstr('local_llm_section'))
+local_frame.grid(column=0, row=5, sticky='ew', padx=5, pady=5)
+
+Label(local_frame, text=localization.getstr('local_endpoint_label')).grid(column=0, row=0, sticky='w', padx=5, pady=4)
+local_endpoint_input = Entry(local_frame, textvariable=local_endpoint_var, width=50)
+local_endpoint_input.grid(column=1, row=0, sticky='ew', padx=5, pady=4)
+
+Label(local_frame, text=localization.getstr('local_model_label')).grid(column=0, row=1, sticky='w', padx=5, pady=4)
+local_model_input = Entry(local_frame, textvariable=local_model_var, width=50)
+local_model_input.grid(column=1, row=1, sticky='ew', padx=5, pady=4)
+
+Label(local_frame, text=localization.getstr('local_system_prompt_label')).grid(column=0, row=2, sticky='nw', padx=5, pady=4)
+local_system_prompt_input = tkinter.Text(local_frame, width=50, height=4, wrap="word")
+local_system_prompt_input.grid(column=1, row=2, sticky='ew', padx=5, pady=4)
+local_system_prompt_input.insert("1.0", "당신은 전문 일한 번역가입니다. 주어진 일본어를 한국어로 번역하세요.")
+
+Label(local_frame, text=localization.getstr('local_temperature_label')).grid(column=0, row=3, sticky='w', padx=5, pady=4)
+local_temperature_input = Entry(local_frame, textvariable=local_temperature_var, width=10)
+local_temperature_input.grid(column=1, row=3, sticky='w', padx=5, pady=4)
+
+Label(local_frame, text=localization.getstr('local_apikey_label')).grid(column=0, row=4, sticky='w', padx=5, pady=4)
+local_apikey_input = Entry(local_frame, width=50, show="*")
+local_apikey_input.grid(column=1, row=4, sticky='ew', padx=5, pady=4)
+
+def _apply_local_llm_preset(preset_key):
+    """Fill the Local LLM model / temperature / system-prompt fields with
+    a known preset. Endpoint URL and API key are deliberately untouched —
+    those are environment-specific and the user maintains them."""
+    preset = LOCAL_LLM_PRESETS.get(preset_key)
+    if not preset:
+        return
+    local_model_var.set(preset["model"])
+    local_temperature_var.set(preset["temperature"])
+    local_system_prompt_input.delete("1.0", "end")
+    local_system_prompt_input.insert("1.0", preset["system_prompt"])
+    append_runtime_log(f"Local LLM preset applied: {preset_key}")
+
+
+# Preset toolbar — quick fill for known model archetypes.
+local_preset_frame = Frame(local_frame)
+local_preset_frame.grid(column=0, row=5, columnspan=2, sticky='w', padx=5, pady=(2, 4))
+Label(local_preset_frame, text=localization.getstr('local_preset_label')).grid(column=0, row=0, padx=(0, 6))
+Button(
+    local_preset_frame,
+    text=localization.getstr('local_preset_jakovn'),
+    command=lambda: _apply_local_llm_preset("ja_ko_vn_12b"),
+).grid(column=1, row=0, padx=2)
+Button(
+    local_preset_frame,
+    text=localization.getstr('local_preset_gemma4'),
+    command=lambda: _apply_local_llm_preset("gemma4_uncensored"),
+).grid(column=2, row=0, padx=2)
+
+Label(local_frame, text=localization.getstr('local_llm_hint'), fg="#666", wraplength=520, justify='left').grid(
+    column=0, row=6, columnspan=2, sticky='w', padx=5, pady=(0, 4))
+local_frame.columnconfigure(1, weight=1)
+
 api_inner.columnconfigure(0, weight=1)
 
 
@@ -865,6 +1034,7 @@ def save_all_apikeys():
     save_engine_apikey("openai", get_openai_keys_input())
     save_engine_apikey("claude_pro", get_claude_pro_token_input())
     save_engine_apikey("claude_team", get_claude_team_token_input())
+    save_engine_apikey("local", get_local_apikey_input())
 
 
 def load_all_apikeys():
@@ -889,6 +1059,10 @@ def load_all_apikeys():
     if claude_team:
         claude_team_token_input.delete(0, "end")
         claude_team_token_input.insert(0, claude_team)
+    local_k = load_engine_apikey("local") or ""
+    if local_k:
+        local_apikey_input.delete(0, "end")
+        local_apikey_input.insert(0, local_k)
     # Migrate from legacy single key (set as DeepL by default if empty)
     if not deepl:
         legacy = load_apikey()
@@ -903,12 +1077,18 @@ def load_all_apikeys():
 
 
 save_button_frame = Frame(api_inner)
-save_button_frame.grid(column=0, row=5, sticky='e', pady=(8, 0))
+save_button_frame.grid(column=0, row=6, sticky='e', pady=(8, 0))
 Button(save_button_frame, text=localization.getstr('save_apikeys'), command=save_all_apikeys).pack()
 
-tree_frame = Frame(multifileframe, width=400, height=20)
-tree_frame.grid(column=0, row=0, sticky='nsew')
-tree_frame.grid_rowconfigure(1, weight=0)
+tree_frame = Frame(multifileframe)
+tree_frame.grid(column=0, row=0, sticky='nsew', padx=8, pady=8)
+# Make the tree row absorb extra vertical space when the window grows; the
+# header (row 0) and the bottom button strip (row 2) stay at their natural
+# height. Column 0 fills horizontally for the same reason.
+tree_frame.grid_rowconfigure(1, weight=1)
+tree_frame.grid_columnconfigure(0, weight=1)
+multifileframe.grid_rowconfigure(0, weight=1)
+multifileframe.grid_columnconfigure(0, weight=1)
 
 multifile_header_frame = Frame(tree_frame)
 multifile_header_frame.grid(column=0, row=0, sticky='ew', pady=(2, 4))
@@ -929,7 +1109,12 @@ add_folder_button = Button(
 )
 add_folder_button.grid(column=1, row=0, padx=(8, 4), sticky='e')
 
-file_treeview =ttk.Treeview(tree_frame, columns=( localization.getstr("path"), localization.getstr("size"), localization.getstr("length"),localization.getstr("status")), height=5)
+file_treeview = ttk.Treeview(
+    tree_frame,
+    columns=(localization.getstr("path"), localization.getstr("size"),
+             localization.getstr("length"), localization.getstr("status")),
+    height=22,  # was 5 — fills the larger default window proportionally
+)
 file_treeview.grid(column=0, row=1, sticky='nsew')
 
 # 각 열의 설정
@@ -939,37 +1124,43 @@ file_treeview.heading(localization.getstr("length"), text=localization.getstr("l
 file_treeview.heading(localization.getstr("status"), text=localization.getstr("status"))
 
 file_treeview.column("#0", width=0, stretch=tkinter.NO)
-file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=400)
-file_treeview.column(localization.getstr("size"), anchor=tkinter.W, width=70)
-file_treeview.column(localization.getstr("length"), anchor=tkinter.W, width=90)
-file_treeview.column(localization.getstr("status"), anchor=tkinter.W, width=70)
+# Path column absorbs extra width when the window is wider than the default;
+# the small fixed-width columns (size / length / status) stay readable.
+file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=620, stretch=tkinter.YES)
+file_treeview.column(localization.getstr("size"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
+file_treeview.column(localization.getstr("length"), anchor=tkinter.W, width=100, stretch=tkinter.NO)
+file_treeview.column(localization.getstr("status"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
 
 
 
-# 임시 데이터 삽입
-generationframe = Frame(tree_frame, width=460)
-generationframe.grid(column=0, row=2)
-generationframe.grid_columnconfigure(1, weight=0)
+# Bottom strip: progress bar, generate button, status indicators.
+# Sits below the treeview, full-width so the contents can be centered.
+generationframe = Frame(tree_frame)
+generationframe.grid(column=0, row=2, sticky='ew', pady=(8, 4))
+generationframe.grid_columnconfigure(0, weight=1)
+generationframe.grid_columnconfigure(2, weight=1)  # right side flex for visual balance
 
 file_treeview.bind('<Delete>', on_delete_key_press)
 
-multifile_progressbar = ttk.Progressbar(generationframe, length=400, maximum=20)
-multifile_progressbar.grid(column=0, row=0, padx=(60, 90), pady=10, sticky='e')
+# Progress bar grows with the window for a clearer visual cue at all widths.
+multifile_progressbar = ttk.Progressbar(generationframe, length=500, maximum=20)
+multifile_progressbar.grid(column=1, row=0, padx=(0, 12), pady=6, sticky='ew')
 
 multifile_generation_button = Button(generationframe, text=localization.getstr('generate'), command=proceedmultifile)
-multifile_generation_button.grid(column=1, row=0,padx=(0, 80), sticky='w')
+multifile_generation_button.grid(column=2, row=0, padx=(0, 0), sticky='w')
 
 multifile_indicator_frame = Frame(generationframe)
-multifile_indicator_frame.grid(column=0, row=1)
+multifile_indicator_frame.grid(column=1, row=1, sticky='w')
+
+multifile_status_label = Label(multifile_indicator_frame, text="0%")
+multifile_status_label.grid(column=0, row=0, padx=(0, 12))
 
 multifile_list_label = Label(multifile_indicator_frame, text="0/0", anchor='w')
 multifile_list_label.grid(column=1, row=0, sticky='w')
 
-multifile_status_label = Label(multifile_indicator_frame, text = "0%")
-multifile_status_label.grid(column=0, row=0)
-
-
-Label(multifile_indicator_frame, text="JoyForce").grid(column=0, row=3, columnspan=2)
+# Footer credit, centered across the bottom of the multifile tab.
+Label(generationframe, text="JoyForce", fg="#888").grid(
+    column=0, row=2, columnspan=3, pady=(6, 0))
 
 
 initialize()
