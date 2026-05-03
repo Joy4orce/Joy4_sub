@@ -46,6 +46,9 @@ localize_strings = {
         'local_system_prompt_label' : "시스템 프롬프트",
         'local_temperature_label' : "Temperature",
         'local_apikey_label' : "API 키 (선택)",
+        'local_preset_label' : "프리셋 적용:",
+        'local_preset_jakovn' : "ja-ko-vn 12B 권장",
+        'local_preset_gemma4' : "Gemma 4 권장",
         'local_llm_hint' : "* koboldcpp / LM Studio / Ollama 등 OpenAI 호환 서버를 로컬에서 실행하세요. 라인 수 보존 지시문은 자동으로 시스템 프롬프트 끝에 추가됩니다."
     },
     'base' : {
@@ -91,6 +94,9 @@ localize_strings = {
         'local_system_prompt_label' : "System prompt",
         'local_temperature_label' : "Temperature",
         'local_apikey_label' : "API key (optional)",
+        'local_preset_label' : "Apply preset:",
+        'local_preset_jakovn' : "ja-ko-vn 12B",
+        'local_preset_gemma4' : "Gemma 4",
         'local_llm_hint' : "* Point this at any OpenAI-compatible local server (koboldcpp / LM Studio / Ollama / llama.cpp / vLLM). The line-count preservation instruction is appended to your system prompt automatically."
     }
 }

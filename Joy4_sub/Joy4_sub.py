@@ -190,6 +190,32 @@ OPENAI_MODEL_OPTIONS = [
     "gpt-4o",                 # expensive, best quality
 ]
 
+# Local LLM presets — quick fill for known model archetypes. Endpoint URL
+# and API key are intentionally NOT touched; those are environment-specific
+# and the user maintains them. Only the per-model behavior (system prompt,
+# temperature, model label) is filled.
+LOCAL_LLM_PRESETS = {
+    "ja_ko_vn_12b": {
+        "label_key": "local_preset_jakovn",
+        "model": "ja-ko-vn-12b-v2",
+        "temperature": "0.1",
+        "system_prompt": (
+            "당신은 전문 일한 번역가입니다. "
+            "주어진 일본어를 한국어로 번역하세요."
+        ),
+    },
+    "gemma4_uncensored": {
+        "label_key": "local_preset_gemma4",
+        "model": "Gemma-4-E4B-Uncensored",
+        "temperature": "0.3",
+        "system_prompt": (
+            "당신은 전문 자막 번역가입니다. 주어진 본문을 직역 위주로 자연스러운 한국어로 옮기세요. "
+            "설명, 주석, 사족, 메타 텍스트는 절대 추가하지 마세요. "
+            "원문 외의 내용은 출력하지 마세요."
+        ),
+    },
+}
+
 
 def _get_text_widget_content(widget):
     """Return the content of a Text widget without the trailing newline."""
@@ -941,8 +967,37 @@ Label(local_frame, text=localization.getstr('local_apikey_label')).grid(column=0
 local_apikey_input = Entry(local_frame, width=50, show="*")
 local_apikey_input.grid(column=1, row=4, sticky='ew', padx=5, pady=4)
 
+def _apply_local_llm_preset(preset_key):
+    """Fill the Local LLM model / temperature / system-prompt fields with
+    a known preset. Endpoint URL and API key are deliberately untouched —
+    those are environment-specific and the user maintains them."""
+    preset = LOCAL_LLM_PRESETS.get(preset_key)
+    if not preset:
+        return
+    local_model_var.set(preset["model"])
+    local_temperature_var.set(preset["temperature"])
+    local_system_prompt_input.delete("1.0", "end")
+    local_system_prompt_input.insert("1.0", preset["system_prompt"])
+    append_runtime_log(f"Local LLM preset applied: {preset_key}")
+
+
+# Preset toolbar — quick fill for known model archetypes.
+local_preset_frame = Frame(local_frame)
+local_preset_frame.grid(column=0, row=5, columnspan=2, sticky='w', padx=5, pady=(2, 4))
+Label(local_preset_frame, text=localization.getstr('local_preset_label')).grid(column=0, row=0, padx=(0, 6))
+Button(
+    local_preset_frame,
+    text=localization.getstr('local_preset_jakovn'),
+    command=lambda: _apply_local_llm_preset("ja_ko_vn_12b"),
+).grid(column=1, row=0, padx=2)
+Button(
+    local_preset_frame,
+    text=localization.getstr('local_preset_gemma4'),
+    command=lambda: _apply_local_llm_preset("gemma4_uncensored"),
+).grid(column=2, row=0, padx=2)
+
 Label(local_frame, text=localization.getstr('local_llm_hint'), fg="#666", wraplength=520, justify='left').grid(
-    column=0, row=5, columnspan=2, sticky='w', padx=5, pady=(0, 4))
+    column=0, row=6, columnspan=2, sticky='w', padx=5, pady=(0, 4))
 local_frame.columnconfigure(1, weight=1)
 
 api_inner.columnconfigure(0, weight=1)

@@ -113,6 +113,88 @@ def _parse_response(text, expected_count):
     return None
 
 
+def _normalize_to_length(parsed_lines, expected_count, source_lines):
+    """Reconcile a parsed translation list with the expected line count.
+
+    Returns the same list when lengths match. When the model produced fewer
+    items than expected, missing slots are filled with the corresponding
+    source line so the SRT alignment doesn't collapse downstream — the user
+    sees the original line for those positions instead of a blank. When the
+    model produced more, extras are dropped.
+
+    Always emits a runtime warning if a mismatch occurred so the user can
+    inspect what went wrong.
+    """
+    parsed = list(parsed_lines)
+    actual = len(parsed)
+    if actual == expected_count:
+        return parsed
+    append_runtime_log(
+        f"Local LLM line-count mismatch: expected {expected_count}, got {actual}; "
+        f"{'padding with source' if actual < expected_count else 'truncating extras'}"
+    )
+    if actual < expected_count:
+        # Pad missing tail with the corresponding source lines (better than
+        # blanks — the user can see roughly where the truncation happened).
+        for idx in range(actual, expected_count):
+            parsed.append(source_lines[idx] if idx < len(source_lines) else "")
+        return parsed
+    return parsed[:expected_count]
+
+
+def _per_line_fallback(client, model_name, system_prompt_prefix, target_lang,
+                       lines, temperature, uiwrapper):
+    """Last-ditch translation when batch attempts all failed: send each line
+    in its own request. Slow (N round trips), but immune to JSON-array
+    formatting mishaps and line-count drift since each call returns one
+    translation. Failures fall back to the source line so the file can still
+    finish without dropping content.
+    """
+    append_runtime_log(
+        f"Local LLM per-line fallback engaged for {len(lines)} lines"
+    )
+    uiwrapper.update_percentagelabel_post(
+        "text", f"Local LLM 라인별 fallback (0/{len(lines)})"
+    )
+    out = []
+    single_suffix = (
+        f" Translate to {target_lang}. "
+        "Reply with ONLY the translated sentence, nothing else. "
+        "No explanations. No quotes. No formatting."
+    )
+    for idx, line in enumerate(lines, 1):
+        if not line.strip():
+            out.append(line)
+            continue
+        prompt = (system_prompt_prefix + single_suffix + "\n\n" + line)
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=1024,
+            )
+            raw = (response.choices[0].message.content or "").strip()
+            # Strip stray quotes/fences the model might add despite instructions
+            raw = re.sub(r'^["\'`]+|["\'`]+$', '', raw).strip()
+            raw = _strip_markdown_fences(raw)
+            out.append(raw if raw else line)
+        except Exception as e:
+            append_runtime_log(
+                f"Local LLM per-line fallback failed at line {idx}: "
+                f"{type(e).__name__}: {e}; keeping source"
+            )
+            out.append(line)
+        if idx % 5 == 0 or idx == len(lines):
+            uiwrapper.update_percentagelabel_post(
+                "text", f"Local LLM 라인별 fallback ({idx}/{len(lines)})"
+            )
+    append_runtime_log(
+        f"Local LLM per-line fallback completed: {len(out)} lines produced"
+    )
+    return out
+
+
 def _attempt_translation(client, model_name, merged_prompt, temperature, expected_count):
     """One translation API call. Returns (parsed_list, raw_text, error_text).
 
@@ -359,11 +441,12 @@ def translateusinglocal(text, uiwrapper):
                 client, model_name, lines, parsed, target_lang
             )
             if verdict is True:
+                normalized = _normalize_to_length(parsed, len(lines), lines)
                 append_runtime_log(
                     f"Local LLM PASS on attempt {attempt}/{MAX_RETRY_ATTEMPTS} "
                     f"({len(lines)} lines, temp={attempt_temp:.2f})"
                 )
-                return parsed
+                return normalized
             if verdict is None:
                 append_runtime_log(
                     f"Local LLM verification call failed on attempt {attempt}; treating as FAIL"
@@ -375,19 +458,39 @@ def translateusinglocal(text, uiwrapper):
                 )
             last_attempt_lines = parsed  # remember in case all retries exhaust
 
-        # All attempts failed verification. Returning None so mywhisper's
-        # _translate_one_batch falls back to keeping the source lines for
-        # this batch — the rest of the file still completes.
+        # All batch attempts failed verification. Before giving up entirely,
+        # try a per-line fallback: each line gets its own request, which
+        # bypasses the JSON-array formatting fragility that's most often
+        # the root cause of batch failures with smaller / more verbose
+        # local models. If that also fails, mywhisper's _translate_one_batch
+        # will still keep source text via its None-handling.
         append_runtime_log(
-            f"Local LLM exhausted {MAX_RETRY_ATTEMPTS} attempts without passing verification "
-            f"({len(lines)} lines); batch will fall back to original text"
+            f"Local LLM exhausted {MAX_RETRY_ATTEMPTS} batch attempts; trying per-line fallback "
+            f"({len(lines)} lines)"
         )
         uiwrapper.update_percentagelabel_post(
-            "text", f"Local LLM 검수 {MAX_RETRY_ATTEMPTS}회 실패 - 원문 유지"
+            "text", f"Local LLM 배치 {MAX_RETRY_ATTEMPTS}회 실패 - 라인별 fallback"
         )
-        # We deliberately return None (not last_attempt_lines): if we couldn't
-        # verify the output, we'd rather show the source text than a bad
-        # translation that looked right structurally.
+        try:
+            # Use the user's original system prompt without the JSON-array
+            # suffix — single-line mode wants a plain sentence back.
+            base_prompt = (user_system_prompt or DEFAULT_SYSTEM_PROMPT).rstrip()
+            fallback = _per_line_fallback(
+                client, model_name, base_prompt, target_lang, lines,
+                temperature, uiwrapper,
+            )
+            if fallback and len(fallback) == len(lines):
+                append_runtime_log(
+                    f"Local LLM per-line fallback succeeded for {len(lines)} lines"
+                )
+                return fallback
+        except Exception as e:
+            append_runtime_log(
+                f"Local LLM per-line fallback raised: {type(e).__name__}: {e}"
+            )
+        uiwrapper.update_percentagelabel_post(
+            "text", "Local LLM 모든 시도 실패 - 원문 유지"
+        )
         return None
 
     except Exception as e:
