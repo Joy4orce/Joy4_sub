@@ -128,31 +128,59 @@ def _default_max_bytes_for_engine(uiwrapper):
     return 20000
 
 
+def _split_into_batches(lines, max_bytes):
+    """Group subtitle lines into UTF-8-byte-bounded batches up front so the
+    caller can show batch-of-N progress. Equivalent to the previous streaming
+    behavior in translate_subtitle_lines but exposed as a list."""
+    batches = []
+    current = []
+    current_size = 0
+    for line in lines:
+        line_size = len(line.encode("utf-8"))
+        if current and current_size + line_size > max_bytes:
+            batches.append(current)
+            current = []
+            current_size = 0
+        current.append(line)
+        current_size += line_size
+    if current:
+        batches.append(current)
+    return batches
+
+
 def translate_subtitle_lines(lines, uiwrapper, max_bytes=None):
     if max_bytes is None:
         max_bytes = _default_max_bytes_for_engine(uiwrapper)
+
+    batches = _split_into_batches(lines, max_bytes)
+    if not batches:
+        return []
+
+    engine = (
+        uiwrapper.get_translation_engine()
+        if hasattr(uiwrapper, 'get_translation_engine')
+        else "DeepL"
+    )
+
+    # Repurpose the progress bar from "seconds of audio" (transcription scale)
+    # to "batches translated" so the user sees movement during the translation
+    # phase. Without this, DeepL / Gemini / ChatGPT show the bar frozen at
+    # the post-transcription value and only the "Transcription done…" text
+    # message persists until the entire file finishes — looking like a hang.
+    total = len(batches)
+    uiwrapper.update_progressbar("maximum", total)
+    uiwrapper.update_progressbar("value", 0)
+
     translated_lines = []
-    batch = []
-    batch_size = 0
-
-    for line in lines:
-        candidate_size = len(line.encode("utf-8"))
-        if batch and batch_size + candidate_size > max_bytes:
-            translated_batch = _translate_one_batch(batch, uiwrapper)
-            if not translated_batch:
-                return None
-            translated_lines.extend(translated_batch)
-            batch = []
-            batch_size = 0
-
-        batch.append(line)
-        batch_size += candidate_size
-
-    if batch:
+    for index, batch in enumerate(batches, start=1):
+        uiwrapper.update_percentagelabel_post(
+            "text", f"{engine} 번역 중 ({index}/{total} 배치)"
+        )
         translated_batch = _translate_one_batch(batch, uiwrapper)
         if not translated_batch:
             return None
         translated_lines.extend(translated_batch)
+        uiwrapper.update_progressbar("value", index)
 
     return translated_lines
 

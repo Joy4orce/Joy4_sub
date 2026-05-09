@@ -8,6 +8,7 @@ from tkinter import messagebox
 import tkinter.ttk as ttk
 
 import threading
+import json
 import os
 import re
 import subprocess
@@ -566,6 +567,80 @@ def proceedfastwhisperthread():
     release_retained_cuda_models()
     append_runtime_log(f"Finished single file job: {targetfile}")
 
+# Worker subprocess emits progress events to stdout prefixed with this
+# sentinel. _run_worker_with_progress() peels them off and forwards them
+# into multifile_queue so the UI updates live during long worker runs
+# (multifile + CUDA + fast whisper). Must match worker_subprocess.PROGRESS_SENTINEL.
+WORKER_PROGRESS_SENTINEL = "__J4S_PROG__"
+
+
+def _run_worker_with_progress(args, cwd, queue_obj):
+    """Spawn worker_subprocess.py and stream its progress messages back into
+    `queue_obj` in real time. Returns a (returncode, stdout_str, stderr_str)
+    tuple after the worker exits — the same shape the caller used to get
+    from subprocess.run(capture_output=True), so the surrounding rate-limit
+    / failure handling didn't have to change.
+
+    Lines on stdout that start with the worker's progress sentinel are
+    JSON-decoded and pushed onto the queue as (text, value) tuples for the
+    existing UI dispatcher to render. Anything else is captured verbatim
+    and returned in stdout_str so it still ends up in runtime.log.
+    """
+    popen_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "cwd": cwd,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,  # line-buffered on the parent side
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    proc = subprocess.Popen(args, **popen_kwargs)
+
+    stdout_chunks = []
+    stderr_chunks = []
+
+    def _drain_stdout():
+        try:
+            for line in proc.stdout:
+                if line.startswith(WORKER_PROGRESS_SENTINEL):
+                    try:
+                        payload = json.loads(line[len(WORKER_PROGRESS_SENTINEL):].strip())
+                        # payload = {"m": "text"|"bar", "l": <label>, "v": <value>}
+                        # Forward as (label, value) — the UI dispatcher in
+                        # multifile_update_from_queue already handles
+                        # "text"/"value"/"maximum" labels uniformly.
+                        queue_obj.put((payload.get("l"), payload.get("v")))
+                    except Exception:
+                        # Mangled progress line — fall back to logging.
+                        stdout_chunks.append(line)
+                else:
+                    stdout_chunks.append(line)
+        except Exception:
+            pass
+
+    def _drain_stderr():
+        try:
+            for line in proc.stderr:
+                stderr_chunks.append(line)
+        except Exception:
+            pass
+
+    t_out = threading.Thread(target=_drain_stdout, daemon=True)
+    t_err = threading.Thread(target=_drain_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+
+    proc.wait()
+    t_out.join(timeout=2)
+    t_err.join(timeout=2)
+
+    return proc.returncode, "".join(stdout_chunks), "".join(stderr_chunks)
+
+
 def proceed_multifile_whisperthread():
     global multi_processing
     from mywhisper import transcribe_from_mp3_fast_whisper, transcribe_from_mp3_whisper, release_retained_cuda_models
@@ -638,20 +713,23 @@ def proceed_multifile_whisperthread():
 
                 rate_limit_cancelled = False
                 while True:
-                    completed = subprocess.run(
+                    # _run_worker_with_progress streams the worker's progress
+                    # events back into multifile_queue in real time, so the
+                    # UI no longer freezes on the post-transcription text
+                    # for the entire CUDA+fast-whisper run. Returns the same
+                    # (returncode, stdout, stderr) shape the old subprocess.run
+                    # did, with progress lines stripped from stdout.
+                    returncode, worker_stdout, worker_stderr = _run_worker_with_progress(
                         worker_args,
                         cwd=os.path.dirname(__file__),
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
+                        queue_obj=multifile_queue,
                     )
-                    append_runtime_log(f"Worker process exited with code {completed.returncode} for {file}")
-                    if completed.stdout.strip():
-                        append_runtime_log(f"Worker stdout for {file}: {completed.stdout.strip()}")
-                    if completed.stderr.strip():
-                        append_runtime_log(f"Worker stderr for {file}: {completed.stderr.strip()}")
-                    if completed.returncode == 2:
+                    append_runtime_log(f"Worker process exited with code {returncode} for {file}")
+                    if worker_stdout.strip():
+                        append_runtime_log(f"Worker stdout for {file}: {worker_stdout.strip()}")
+                    if worker_stderr.strip():
+                        append_runtime_log(f"Worker stderr for {file}: {worker_stderr.strip()}")
+                    if returncode == 2:
                         append_runtime_log(f"Claude rate limit at subprocess item {i + 1}/{len(file_list)}: {file}")
                         multifile_queue.put(("text", f"Claude 제한량 도달 ({i + 1}/{len(file_list)}) - 대기 중..."))
                         should_resume = _rate_limit_wait(multifile_queue, os.path.basename(file))
@@ -663,7 +741,7 @@ def proceed_multifile_whisperthread():
                             multifile_queue.put(("text", "작업 취소됨"))
                             rate_limit_cancelled = True
                             break
-                    elif completed.returncode != 0:
+                    elif returncode != 0:
                         multifile_queue.put(("text", f"Worker failed: {os.path.basename(file)}"))
                         break
                     else:
