@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 
@@ -10,6 +11,45 @@ from mywhisper import (
     transcribe_from_mp3_fast_whisper,
     transcribe_from_mp3_whisper,
 )
+
+
+# Sentinel prefix for progress messages on stdout. The parent process matches
+# on this prefix to forward worker-side progress events (text labels, bar
+# values, batch counters) into multifile_queue in real time. Anything that
+# doesn't start with the prefix is treated as ordinary stdout and just
+# logged. ASCII-only so encoding never trips it up.
+PROGRESS_SENTINEL = "__J4S_PROG__"
+
+
+# Make sure stdout is UTF-8 and line-buffered so the parent can read complete
+# JSON messages as soon as the worker emits them. Without this, Korean
+# characters in progress text can get mangled on Windows code-page consoles
+# (cp949), and buffered writes don't reach the parent until exit.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+except Exception:
+    pass
+
+
+def _emit_progress(method, label, value):
+    """Print one JSON-encoded progress event to stdout for the parent to
+    consume. `method` is which UI surface to update ('text' for the status
+    label, 'bar' for the progress bar). `label` is the existing label
+    discriminator used by the in-process queue ('text' / 'value' /
+    'maximum' / etc.) so the parent's existing message handlers can dispatch
+    on it without knowing about subprocess plumbing.
+    """
+    payload = {"m": method, "l": label, "v": value}
+    try:
+        line = PROGRESS_SENTINEL + json.dumps(payload, ensure_ascii=False)
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except Exception:
+        # Never let a stdout failure break translation. Log and continue.
+        try:
+            append_runtime_log(f"Worker progress emit failed for {payload}")
+        except Exception:
+            pass
 
 
 class WorkerUIWrapper:
@@ -43,9 +83,13 @@ class WorkerUIWrapper:
         self.local_apikey = local_apikey
 
     def update_percentagelabel_post(self, text, value):
+        # Forward to parent UI through the stdout sentinel channel (when
+        # available) AND keep logging to runtime.log for offline debugging.
+        _emit_progress("text", text, value)
         append_runtime_log(f"Worker progress text={text} value={value}")
 
     def update_progressbar(self, text, value):
+        _emit_progress("bar", text, value)
         append_runtime_log(f"Worker progress update {text}={value}")
 
     def getkey(self):
