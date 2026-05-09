@@ -207,7 +207,10 @@ def _attempt_translation(client, model_name, merged_prompt, temperature, expecte
             model=model_name,
             messages=[{"role": "user", "content": merged_prompt}],
             temperature=temperature,
-            max_tokens=8192,
+            # 컨텍스트 사이즈(보통 8192)와 같거나 크면 KoboldCpp 가
+            # "max_length near max_context_length" 경고 + 입력 잘림.
+            # 4096 이면 자막 N라인 번역 출력엔 차고 넘침.
+            max_tokens=4096,
         )
         raw = (response.choices[0].message.content or "").strip()
         parsed = _parse_response(raw, expected_count)
