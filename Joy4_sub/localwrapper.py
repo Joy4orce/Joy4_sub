@@ -156,6 +156,15 @@ def _per_line_fallback(client, model_name, system_prompt_prefix, target_lang,
     uiwrapper.update_percentagelabel_post(
         "text", f"Local LLM 라인별 fallback (0/{len(lines)})"
     )
+
+    # If translate_subtitle_lines told us which batch slot we're occupying,
+    # emit fractional bar values within that slot so the user sees movement
+    # during the long per-line phase. Without this hint, the bar would
+    # freeze at the previous batch's value while we churn through 200+
+    # individual API calls.
+    batch_slot = getattr(uiwrapper, '_batch_progress', None)
+    total_lines = len(lines)
+
     out = []
     single_suffix = (
         f" Translate to {target_lang}. "
@@ -165,30 +174,39 @@ def _per_line_fallback(client, model_name, system_prompt_prefix, target_lang,
     for idx, line in enumerate(lines, 1):
         if not line.strip():
             out.append(line)
-            continue
-        prompt = (system_prompt_prefix + single_suffix + "\n\n" + line)
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
-                max_tokens=1024,
-            )
-            raw = (response.choices[0].message.content or "").strip()
-            # Strip stray quotes/fences the model might add despite instructions
-            raw = re.sub(r'^["\'`]+|["\'`]+$', '', raw).strip()
-            raw = _strip_markdown_fences(raw)
-            out.append(raw if raw else line)
-        except Exception as e:
-            append_runtime_log(
-                f"Local LLM per-line fallback failed at line {idx}: "
-                f"{type(e).__name__}: {e}; keeping source"
-            )
-            out.append(line)
+        else:
+            prompt = (system_prompt_prefix + single_suffix + "\n\n" + line)
+            try:
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    max_tokens=1024,
+                )
+                raw = (response.choices[0].message.content or "").strip()
+                # Strip stray quotes/fences the model might add despite instructions
+                raw = re.sub(r'^["\'`]+|["\'`]+$', '', raw).strip()
+                raw = _strip_markdown_fences(raw)
+                out.append(raw if raw else line)
+            except Exception as e:
+                append_runtime_log(
+                    f"Local LLM per-line fallback failed at line {idx}: "
+                    f"{type(e).__name__}: {e}; keeping source"
+                )
+                out.append(line)
         if idx % 5 == 0 or idx == len(lines):
             uiwrapper.update_percentagelabel_post(
-                "text", f"Local LLM 라인별 fallback ({idx}/{len(lines)})"
+                "text", f"Local LLM 라인별 fallback ({idx}/{total_lines})"
             )
+            # Bar update — fractional within current batch slot if known,
+            # otherwise scale 0..total_lines so the bar still moves visibly.
+            if batch_slot is not None:
+                batch_idx, batch_total = batch_slot
+                fraction = idx / total_lines
+                uiwrapper.update_progressbar("value", (batch_idx - 1) + fraction)
+            else:
+                uiwrapper.update_progressbar("maximum", total_lines)
+                uiwrapper.update_progressbar("value", idx)
     append_runtime_log(
         f"Local LLM per-line fallback completed: {len(out)} lines produced"
     )
