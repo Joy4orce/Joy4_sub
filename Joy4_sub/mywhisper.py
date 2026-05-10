@@ -173,6 +173,18 @@ def translate_subtitle_lines(lines, uiwrapper, max_bytes=None):
 
     translated_lines = []
     for index, batch in enumerate(batches, start=1):
+        # Stash current-batch info on the uiwrapper so engine wrappers that
+        # do their own multi-step work inside one batch (notably Local LLM's
+        # per-line fallback, which can take tens of minutes for 200+ lines)
+        # can emit fractional bar values within this batch's slot. Inner
+        # callers compute (index - 1) + (sub_progress / sub_total) so the
+        # bar smoothly grows across the slot instead of staying frozen at
+        # the previous batch's value while text-only updates flicker by.
+        try:
+            uiwrapper._batch_progress = (index, total)
+        except (AttributeError, TypeError):
+            pass
+
         uiwrapper.update_percentagelabel_post(
             "text", f"{engine} 번역 중 ({index}/{total} 배치)"
         )
@@ -180,7 +192,17 @@ def translate_subtitle_lines(lines, uiwrapper, max_bytes=None):
         if not translated_batch:
             return None
         translated_lines.extend(translated_batch)
+        # Re-affirm the batch-level scale and value in case an inner
+        # fallback path temporarily changed them.
+        uiwrapper.update_progressbar("maximum", total)
         uiwrapper.update_progressbar("value", index)
+
+    try:
+        # No active batch slot anymore — clear the hint so any later
+        # accidental use of inner fractional emit becomes a no-op.
+        delattr(uiwrapper, '_batch_progress')
+    except (AttributeError, TypeError):
+        pass
 
     return translated_lines
 
