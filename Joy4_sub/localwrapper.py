@@ -36,6 +36,23 @@ MAX_RETRY_ATTEMPTS = 3
 TEMPERATURE_BUMP_PER_ATTEMPT = 0.2
 TEMPERATURE_CEILING = 0.9
 
+# Per-call timeouts (seconds). OpenAI SDK's default is 600s which is
+# practically "forever" from the user's perspective when koboldcpp hangs
+# or chokes on a large prompt. These cap each call so a stuck request
+# raises an exception within a tolerable window and the retry / fallback
+# logic can continue instead of freezing the whole file.
+TRANSLATE_CALL_TIMEOUT = 300.0  # 5 min — generous for slow local models on big batches
+VERIFY_CALL_TIMEOUT = 60.0      # 1 min — verify generates ≤10 tokens; mostly prompt-bound
+PER_LINE_CALL_TIMEOUT = 60.0    # 1 min — single subtitle line, should be quick
+
+# Cap on how many sample line pairs the verify prompt embeds. The previous
+# implementation sent every source / translated line, which made the verify
+# prompt as large as the batch itself (3000+ tokens for a 50-line batch).
+# A small sample is enough to detect the failure modes we actually care
+# about (wrong language, echoed source); structural checks like line-count
+# mismatch are handled programmatically before the model call.
+VERIFY_SAMPLE_LIMIT = 6
+
 # Errors that indicate "the local server isn't running" — surfaced with a
 # friendlier message so the user knows to start koboldcpp / LM Studio first.
 CONNECTION_ERROR_PATTERNS = [
@@ -182,6 +199,7 @@ def _per_line_fallback(client, model_name, system_prompt_prefix, target_lang,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=temperature,
                     max_tokens=1024,
+                    timeout=PER_LINE_CALL_TIMEOUT,
                 )
                 raw = (response.choices[0].message.content or "").strip()
                 # Strip stray quotes/fences the model might add despite instructions
@@ -229,12 +247,25 @@ def _attempt_translation(client, model_name, merged_prompt, temperature, expecte
             # "max_length near max_context_length" 경고 + 입력 잘림.
             # 4096 이면 자막 N라인 번역 출력엔 차고 넘침.
             max_tokens=4096,
+            timeout=TRANSLATE_CALL_TIMEOUT,
         )
         raw = (response.choices[0].message.content or "").strip()
         parsed = _parse_response(raw, expected_count)
         return parsed, raw, ""
     except Exception as e:
         return None, "", f"{type(e).__name__}: {e}"
+
+
+def _sample_line_pairs(source_lines, translated_lines, limit):
+    """Pick up to `limit` (source, translated) pairs evenly spaced across the
+    batch, including the first and last. Used to keep the verify prompt small
+    even when the batch is large."""
+    n = len(source_lines)
+    if n <= limit:
+        return list(zip(source_lines, translated_lines))
+    # Always include endpoints; spread the rest evenly.
+    indices = sorted({0, n - 1, *(int(round(i * (n - 1) / (limit - 1))) for i in range(limit))})[:limit]
+    return [(source_lines[i], translated_lines[i]) for i in indices]
 
 
 def _verify_translation(client, model_name, source_lines, translated_lines, target_lang):
@@ -247,25 +278,56 @@ def _verify_translation(client, model_name, source_lines, translated_lines, targ
     accepting its own (possibly wrong) output on subjective criteria.
 
     Returns True on PASS, False on FAIL or unparseable response, or None if the
-    verification call itself raised an exception (e.g. connection drop). The
-    caller should treat None as "verification unavailable" — usually retry.
+    verification call itself raised an exception (e.g. connection drop or
+    timeout). The caller should treat None as "verification unavailable" —
+    usually retry.
+
+    Programmatic short-circuits are tried before any model call so the common
+    failure modes don't pay the per-call cost (which can be 30+ seconds when
+    the model is loaded with a big prompt).
     """
+    # --- Programmatic short-circuit 1: line-count mismatch ---
     if len(source_lines) != len(translated_lines):
-        # Trivially fails one of our checks; no need to ask the model.
+        append_runtime_log(
+            f"Local LLM verification: line-count mismatch "
+            f"({len(source_lines)} source vs {len(translated_lines)} translated); "
+            f"FAIL without model call"
+        )
         return False
+
+    # --- Programmatic short-circuit 2: full echo of the source ---
+    # If every non-empty translated line is byte-identical to its source, the
+    # model regurgitated the input. Definite FAIL — no need to consult it.
+    non_empty_pairs = [(s, t) for s, t in zip(source_lines, translated_lines) if s.strip()]
+    if non_empty_pairs and all(s == t for s, t in non_empty_pairs):
+        append_runtime_log(
+            f"Local LLM verification: every translated line identical to source "
+            f"(echo bug); FAIL without model call"
+        )
+        return False
+
+    # --- Model call: slim prompt with a sample of line pairs ---
+    # Sending the full source + translation arrays could easily push the
+    # verify prompt to 3000+ tokens for a 50-line batch, which then takes
+    # 30s+ on a busy local GPU and looks like a hang. A small evenly-spaced
+    # sample preserves the ability to spot wrong-language / partial-echo
+    # without the prompt-size penalty.
+    samples = _sample_line_pairs(source_lines, translated_lines, VERIFY_SAMPLE_LIMIT)
+    samples_block = "\n".join(
+        f"  [{i + 1}] source: {s!r}\n      translation: {t!r}"
+        for i, (s, t) in enumerate(samples)
+    )
 
     verification_prompt = (
         "You are a strict translation reviewer. Reply with exactly one word.\n\n"
-        f"Source ({len(source_lines)} lines):\n"
-        f"{json.dumps(source_lines, ensure_ascii=False)}\n\n"
-        f"Translation (claimed {target_lang}, {len(translated_lines)} lines):\n"
-        f"{json.dumps(translated_lines, ensure_ascii=False)}\n\n"
+        f"A batch of {len(source_lines)} subtitle lines was translated into {target_lang}.\n"
+        f"Below are {len(samples)} sample line pairs from that batch:\n\n"
+        f"{samples_block}\n\n"
         "Verify ALL of these:\n"
-        f"1. The translation has exactly {len(source_lines)} entries.\n"
-        f"2. Every non-empty entry is written in {target_lang} (not the source language).\n"
-        "3. No translated entry is identical to its corresponding source entry "
+        f"1. Every translation is written in {target_lang} (not the source language).\n"
+        "2. No translated line is identical to its corresponding source line "
         "(unless the source was already in the target language, e.g. proper nouns).\n"
-        "4. The general meaning is preserved.\n\n"
+        "3. The general meaning of each pair is preserved.\n\n"
         "Reply with exactly one word: PASS or FAIL. No explanation, no punctuation."
     )
 
@@ -275,10 +337,15 @@ def _verify_translation(client, model_name, source_lines, translated_lines, targ
             messages=[{"role": "user", "content": verification_prompt}],
             temperature=0.0,  # deterministic for binary judgment
             max_tokens=10,
+            timeout=VERIFY_CALL_TIMEOUT,
         )
         verdict = (response.choices[0].message.content or "").strip().upper()
-    except Exception:
-        return None  # verification call broken — caller decides what to do
+    except Exception as e:
+        append_runtime_log(
+            f"Local LLM verification call failed/timed out: "
+            f"{type(e).__name__}: {e}"
+        )
+        return None  # caller decides — usually retry the translation
 
     # Tolerate trailing punctuation, whitespace, markdown, etc.
     verdict_token = re.match(r'\s*\W*([A-Z]+)', verdict)
