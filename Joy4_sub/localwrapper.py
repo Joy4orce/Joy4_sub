@@ -355,6 +355,35 @@ def _verify_translation(client, model_name, source_lines, translated_lines, targ
     return False
 
 
+def _nudge_attempt_progress(uiwrapper, attempt, phase):
+    """Emit a fractional bar value so the user sees movement at each
+    attempt / phase boundary inside one batch.
+
+    The verify and translate steps are each a single long API call — we
+    can't update the bar *during* one — so the next best thing is to
+    nudge the bar at every transition (translate→verify→next translate→…).
+    Without this the bar sits at the previous batch's value while the
+    text label scrolls through retries, looking exactly like a hang even
+    though the work is actually progressing.
+
+    Uses MAX_RETRY_ATTEMPTS * 2 sub-phases per batch (one for translate,
+    one for verify per attempt). Maps each phase to a fraction of the
+    current batch slot. Caps at 0.95 so the bar doesn't visually
+    "complete" before translate_subtitle_lines confirms the batch with
+    its own value=batch_idx tick — and so per-line fallback (which uses
+    fractional emits 0..1 of slot) has somewhere distinct to take over.
+    """
+    slot = getattr(uiwrapper, '_batch_progress', None)
+    if not slot:
+        return
+    batch_idx, _total = slot
+    sub_phases = MAX_RETRY_ATTEMPTS * 2
+    phase_offset = 0 if phase == 'translate' else 1
+    phase_idx = (attempt - 1) * 2 + phase_offset
+    fraction = min(phase_idx / sub_phases, 0.95)
+    uiwrapper.update_progressbar("value", (batch_idx - 1) + fraction)
+
+
 def _resolve_setting(uiwrapper, getter_name, default):
     """Read a setting from uiwrapper if the getter exists, else use the default."""
     if hasattr(uiwrapper, getter_name):
@@ -493,6 +522,7 @@ def translateusinglocal(text, uiwrapper):
                 "text",
                 f"Local LLM 번역 중 ({attempt}/{MAX_RETRY_ATTEMPTS}, temp={attempt_temp:.2f})",
             )
+            _nudge_attempt_progress(uiwrapper, attempt, 'translate')
             parsed, raw, err = _attempt_translation(
                 client, model_name, merged_user_prompt, attempt_temp, len(lines)
             )
@@ -525,6 +555,7 @@ def translateusinglocal(text, uiwrapper):
                 "text",
                 f"Local LLM 검수 중 ({attempt}/{MAX_RETRY_ATTEMPTS})",
             )
+            _nudge_attempt_progress(uiwrapper, attempt, 'verify')
             verdict = _verify_translation(
                 client, model_name, lines, parsed, target_lang
             )
