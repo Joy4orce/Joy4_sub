@@ -777,57 +777,119 @@ def proceed_multifile_whisperthread():
 
 
 def multifile_update_from_queue():
-    if not multifile_queue.empty():
-        msg = multifile_queue.get()
-        if msg[0] == "maximum":
-            with lock:
-                multifile_progressbar['maximum'] = msg[1]
-        elif msg[0] == "value":
-            with lock:
-                multifile_progressbar['value'] = msg[1]
-        elif msg[0] == "list":
-            with lock:
-                multifile_list_label['text'] = msg[1]
-                check_multifile_status()
-        elif msg[0] == "rate_limit":
-            _show_rate_limit_dialog(msg[1])
-        elif msg[0] == "text" and msg[1] != "Finished":
-            with lock:
-                multifile_status_label['text'] = msg[1]
-        elif msg[1] == "Finished":
-            with lock:
-                all_done = multifile_list_label['text'].split("/")[0] == str(len(file_list))
-                if all_done:
-                    multifile_status_label['text'] = "Finished"
-                multifile_generation_button.config(state=NORMAL)
-                multifile_progressbar['value'] = 0
-                check_multifile_status()
-                file_treeview.bind('<Delete>', on_delete_key_press)
-                return
+    # Drain the entire queue greedily and apply only the most-recent value
+    # per message kind. The old "one message per 100 ms" loop fell minutes
+    # behind during long Claude / Local LLM batches across many files —
+    # producers (engine wrappers, batch loops, worker subprocesses) can
+    # emit dozens of updates per second, while the consumer was capped at
+    # 10 per second, so the visible "1/267" lagged 30+ files behind reality.
+    #
+    # Collapsing to "latest wins" per kind is correct here because each kind
+    # describes current state, not an event stream: the user only needs the
+    # current bar value, current text, current list counter — not the
+    # history. Special signals (rate_limit, Finished) are tracked separately
+    # so they're not lost in the collapse.
+    latest = {}
+    rate_limit_payload = None
+    finished = False
+    drained = 0
+    DRAIN_CAP = 500  # safety: never starve the Tk main loop on a flood
+
+    while drained < DRAIN_CAP:
+        try:
+            msg = multifile_queue.get_nowait()
+        except queue.Empty:
+            break
+        drained += 1
+        kind, val = msg[0], msg[1]
+        if kind == "rate_limit":
+            rate_limit_payload = val
+        elif kind == "text" and val == "Finished":
+            finished = True
+        elif val == "Finished":
+            finished = True
+        else:
+            latest[kind] = val
+
+    if "maximum" in latest:
+        with lock:
+            multifile_progressbar['maximum'] = latest["maximum"]
+    if "value" in latest:
+        with lock:
+            multifile_progressbar['value'] = latest["value"]
+    if "list" in latest:
+        with lock:
+            multifile_list_label['text'] = latest["list"]
+            check_multifile_status()
+    if "text" in latest:
+        with lock:
+            multifile_status_label['text'] = latest["text"]
+
+    if rate_limit_payload is not None:
+        _show_rate_limit_dialog(rate_limit_payload)
+
+    if finished:
+        with lock:
+            all_done = multifile_list_label['text'].split("/")[0] == str(len(file_list))
+            if all_done:
+                multifile_status_label['text'] = "Finished"
+            multifile_generation_button.config(state=NORMAL)
+            multifile_progressbar['value'] = 0
+            check_multifile_status()
+            file_treeview.bind('<Delete>', on_delete_key_press)
+        return
+
     window.after(100, multifile_update_from_queue)
 
 
 
 def update_ui_from_queue():
-    if not update_queue.empty():
-        msg = update_queue.get()
-        if msg[0] == "maximum":
-            with lock:
-                progressbar['maximum'] = msg[1]
-        elif msg[0] == "value":
-            with lock:
-                progressbar['value'] = msg[1]
-        elif msg[0] == "rate_limit":
-            _show_rate_limit_dialog(msg[1])
-        elif msg[0] == "text" and msg[1] != "Finished":
-            with lock:
-                percentagelabel['text'] = msg[1]
-        elif msg[1] == "Finished":
-            with lock:
-                percentagelabel['text'] = msg[1]
-                proceedbutton.config(state=NORMAL)
-                progressbar['value'] = 0
-                return
+    # Single-file tab: same drain-and-collapse pattern as the multifile tab
+    # (see multifile_update_from_queue docstring above for the rationale).
+    # Single-file jobs emit fewer updates so backlog is less visible here,
+    # but the same producers run so a slow Tk tick could still cause lag.
+    latest = {}
+    rate_limit_payload = None
+    finished = False
+    drained = 0
+    DRAIN_CAP = 500
+
+    while drained < DRAIN_CAP:
+        try:
+            msg = update_queue.get_nowait()
+        except queue.Empty:
+            break
+        drained += 1
+        kind, val = msg[0], msg[1]
+        if kind == "rate_limit":
+            rate_limit_payload = val
+        elif kind == "text" and val == "Finished":
+            finished = True
+        elif val == "Finished":
+            finished = True
+        else:
+            latest[kind] = val
+
+    if "maximum" in latest:
+        with lock:
+            progressbar['maximum'] = latest["maximum"]
+    if "value" in latest:
+        with lock:
+            progressbar['value'] = latest["value"]
+    if "text" in latest:
+        with lock:
+            percentagelabel['text'] = latest["text"]
+
+    if rate_limit_payload is not None:
+        _show_rate_limit_dialog(rate_limit_payload)
+
+    if finished:
+        with lock:
+            percentagelabel['text'] = "Finished"
+            proceedbutton.config(state=NORMAL)
+            progressbar['value'] = 0
+        return
+
     window.after(100, update_ui_from_queue)
 
 
