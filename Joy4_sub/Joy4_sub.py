@@ -818,7 +818,14 @@ def proceed_multifile_whisperthread():
         append_runtime_log(f"Multifile worker failed: {type(exc).__name__}: {exc}")
         multifile_queue.put(("text", f"Failed: {type(exc).__name__}"))
     finally:
-        multifile_queue.put(("text", "Finished"))
+        # Use a dedicated sentinel for end-of-batch, NOT ("text", "Finished").
+        # Inner transcribe functions emit ("text", "Finished") on every
+        # per-file completion (a single-file-mode convention), and when
+        # those leak into multifile_queue the consumer would treat the
+        # first one as end-of-batch and stop rescheduling itself —
+        # leaving the UI frozen on file 1 while disk work continued.
+        # See multifile_update_from_queue for the matching consumer side.
+        multifile_queue.put(("__job_done__", None))
         multi_processing = False
 
 
@@ -850,10 +857,18 @@ def multifile_update_from_queue():
         kind, val = msg[0], msg[1]
         if kind == "rate_limit":
             rate_limit_payload = val
+        elif kind == "__job_done__":
+            # Real end-of-batch — only emitted by proceed_multifile_whisperthread's
+            # finally block after the for-loop has finished (or been
+            # cancelled). Consumer exits here.
+            finished = True
         elif kind == "text" and val == "Finished":
-            finished = True
-        elif val == "Finished":
-            finished = True
+            # Per-file leak from inner transcribe functions. Inner
+            # transcribe emits ("text", "Finished") at the end of each
+            # file (single-file-mode convention); in multifile context
+            # that's just "one of N files done" — explicitly ignore so
+            # the consumer doesn't stop on the first file's completion.
+            pass
         else:
             latest[kind] = val
 
