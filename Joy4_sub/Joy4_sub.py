@@ -374,26 +374,26 @@ def on_delete_key_press(event):
     multifile_list_label['text'] = "0/" + str(len(file_list))
 
 def check_multifile_status():
-    # Build the spath -> path map once (O(N)) instead of doing a linear
-    # scan inside the per-item loop (O(N²)). For a 267-file batch on a
-    # slow drive this cut the function from ~3 seconds to <500 ms — the
-    # old O(N²) version was the real reason the UI looked frozen after
-    # PR #6's drain fix: every drained "list" message triggered another
-    # multi-second walk on the main Tk thread.
+    # Build the spath -> path map once (O(N)) instead of scanning the
+    # whole file_list inside each row.
     #
-    # Also skip the treeview update when the status hasn't actually
-    # changed; row updates trigger redraws and add up across 267 items.
+    # Skip rows already marked Done: the .srt won't disappear mid-batch,
+    # so once Done they stay Done. As the batch progresses, the disk-check
+    # workload on subsequent calls shrinks toward O(remaining_undone) —
+    # the very last call only touches rows that genuinely haven't been
+    # processed yet.
     path_by_spath = {spath: path for path, spath in file_list}
 
     for item in file_treeview.get_children():
         item_value = list(file_treeview.item(item, 'values'))
+        if len(item_value) >= 4 and item_value[3] == "Done":
+            continue
         path = path_by_spath.get(item_value[0])
         if path is None:
             continue
         base, _ = os.path.splitext(path)
-        new_status = "Done" if os.path.exists(base + ".srt") else "Undone"
-        if item_value[3] != new_status:
-            item_value[3] = new_status
+        if os.path.exists(base + ".srt"):
+            item_value[3] = "Done"
             file_treeview.item(item, values=tuple(item_value))
 
 def list_label_indicate( number = 0):
@@ -812,6 +812,12 @@ def proceed_multifile_whisperthread():
                     break
             append_runtime_log(f"Returned from worker for multifile item {i + 1}/{len(file_list)}: {file}")
             append_runtime_log(f"Finished multifile item {i + 1}/{len(file_list)}: {file}")
+            # Signal the UI consumer to refresh the Status column for this
+            # file. We don't pass the path — check_multifile_status walks the
+            # treeview and skips rows already marked Done, so it stays cheap
+            # as the batch progresses. Emitted regardless of success/failure;
+            # the disk check inside the refresher decides Done vs leave-alone.
+            multifile_queue.put(("__file_done__", None))
         release_retained_cuda_models()
         append_runtime_log("Released retained CUDA models after multifile batch")
     except Exception as exc:
@@ -845,6 +851,7 @@ def multifile_update_from_queue():
     latest = {}
     rate_limit_payload = None
     finished = False
+    file_done_pending = False
     drained = 0
     DRAIN_CAP = 500  # safety: never starve the Tk main loop on a flood
 
@@ -862,6 +869,11 @@ def multifile_update_from_queue():
             # finally block after the for-loop has finished (or been
             # cancelled). Consumer exits here.
             finished = True
+        elif kind == "__file_done__":
+            # One file just completed (success or failure). Defer the
+            # treeview status refresh until after the drain so multiple
+            # file completions in the same tick coalesce into one walk.
+            file_done_pending = True
         elif kind == "text" and val == "Finished":
             # Per-file leak from inner transcribe functions. Inner
             # transcribe emits ("text", "Finished") at the end of each
@@ -892,6 +904,14 @@ def multifile_update_from_queue():
     if "text" in latest:
         with lock:
             multifile_status_label['text'] = latest["text"]
+
+    if file_done_pending:
+        with lock:
+            # Refresh the Status column. The function skips rows already
+            # Done so per-call cost shrinks across the batch — only the
+            # still-undone rows incur a disk check. Coalesced when multiple
+            # files complete in the same drain tick.
+            check_multifile_status()
 
     if rate_limit_payload is not None:
         _show_rate_limit_dialog(rate_limit_payload)
