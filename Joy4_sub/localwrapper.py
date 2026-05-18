@@ -189,6 +189,17 @@ def _per_line_fallback(client, model_name, system_prompt_prefix, target_lang,
         "No explanations. No quotes. No formatting."
     )
     for idx, line in enumerate(lines, 1):
+        # Cancel checkpoint between single-line calls. Per-line fallback
+        # can take tens of minutes on a 200+ line batch, so the user
+        # really wants Cancel to be effective inside this loop.
+        if hasattr(uiwrapper, 'is_cancelled') and uiwrapper.is_cancelled():
+            append_runtime_log(
+                f"Local LLM per-line fallback cancelled by user at line {idx}/{len(lines)}"
+            )
+            # Pad the unprocessed tail with source so the SRT alignment
+            # downstream doesn't collapse to an empty batch.
+            out.extend(lines[idx - 1:])
+            return out
         if not line.strip():
             out.append(line)
         else:
@@ -514,6 +525,15 @@ def translateusinglocal(text, uiwrapper):
         # (notably Gemma's tendency to echo source language at low temps).
         last_attempt_lines = None
         for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+            # Cancel checkpoint between retry attempts. Each attempt is one
+            # translate + one verify API call, both blocking, so we can
+            # only bail at attempt boundaries — but that's enough to stop
+            # the retry chain within tens of seconds of clicking Cancel.
+            if hasattr(uiwrapper, 'is_cancelled') and uiwrapper.is_cancelled():
+                append_runtime_log(
+                    f"Local LLM cancelled by user at attempt {attempt}/{MAX_RETRY_ATTEMPTS}"
+                )
+                return None
             attempt_temp = min(
                 temperature + (attempt - 1) * TEMPERATURE_BUMP_PER_ATTEMPT,
                 TEMPERATURE_CEILING,

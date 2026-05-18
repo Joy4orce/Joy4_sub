@@ -173,6 +173,12 @@ def translate_subtitle_lines(lines, uiwrapper, max_bytes=None):
 
     translated_lines = []
     for index, batch in enumerate(batches, start=1):
+        # Cancel checkpoint between batches. We can't interrupt mid-batch
+        # (API calls and per-line fallbacks are blocking), but bailing
+        # here gets the user out within seconds of clicking Cancel.
+        if hasattr(uiwrapper, 'is_cancelled') and uiwrapper.is_cancelled():
+            append_runtime_log(f"{engine} translation cancelled by user at batch {index}/{total}")
+            return None
         # Stash current-batch info on the uiwrapper so engine wrappers that
         # do their own multi-step work inside one batch (notably Local LLM's
         # per-line fallback, which can take tens of minutes for 200+ lines)
