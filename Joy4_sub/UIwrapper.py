@@ -6,7 +6,8 @@ class UIwrapper:
                  gemini_model="", openai_model="",
                  claude_pro_token="", claude_team_token="", claude_default_plan="pro",
                  local_endpoint="", local_model="", local_system_prompt="",
-                 local_temperature=0.1, local_apikey=""):
+                 local_temperature=0.1, local_apikey="",
+                 cancel_event=None):
         self.queue = queue
         self.lock = lock
         self.key = key  # legacy: active engine's keys (kept for compat)
@@ -31,6 +32,15 @@ class UIwrapper:
         self.local_system_prompt = local_system_prompt
         self.local_temperature = local_temperature
         self.local_apikey = local_apikey
+        # threading.Event shared across the worker thread and the wrappers
+        # so any cooperative checkpoint (batch boundary, retry attempt,
+        # per-line call) can bail out cleanly when the user hits Cancel.
+        self.cancel_event = cancel_event
+
+    def is_cancelled(self):
+        """True when the user has requested cancellation. Cheap to call —
+        callers should poll this at any natural stop point."""
+        return self.cancel_event is not None and self.cancel_event.is_set()
 
     def update_percentagelabel_post(self, text, value):
         with self.lock:

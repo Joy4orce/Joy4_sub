@@ -46,6 +46,12 @@ _rate_limit_action_event = threading.Event()
 _rate_limit_cancelled = False
 _rate_limit_dialog_window = None
 
+# Cooperative cancellation. Producers (transcription / translation loops,
+# worker subprocesses) poll this between safe checkpoints; UI sets it when
+# the user clicks the Cancel button. Cleared at the start of every new job
+# so leftover state from a previous cancel can't carry over.
+_cancel_event = threading.Event()
+
 __version__ = '1.0'
 
 defaultdir = "C:/Users"
@@ -558,6 +564,7 @@ def proceedfastwhisperthread():
         local_system_prompt=get_local_system_prompt_input(),
         local_temperature=get_local_temperature_input(),
         local_apikey=get_local_apikey_input(),
+        cancel_event=_cancel_event,
     )
     save_all_apikeys()
     settingjson(transferuiwrapper)
@@ -573,6 +580,13 @@ def proceedfastwhisperthread():
         update_queue.put(("text", "작업 취소됨"))
         update_queue.put(("text", "Finished"))
         return
+    finally:
+        # Always signal Finished so the UI resets the Cancel button back
+        # to Generate, whether the job ended naturally, raised, or was
+        # cancelled mid-transcription.
+        if _cancel_event.is_set():
+            update_queue.put(("text", localization.getstr('cancelled')))
+        update_queue.put(("text", "Finished"))
     release_retained_cuda_models()
     append_runtime_log(f"Finished single file job: {targetfile}")
 
@@ -638,14 +652,33 @@ def _run_worker_with_progress(args, cwd, queue_obj):
         except Exception:
             pass
 
+    def _cancel_watcher():
+        # Poll the global cancel event ~5 times per second while the worker
+        # is alive. When the user hits Cancel mid-job, terminate() lets the
+        # multifile + CUDA + fast-whisper path bail out within a second
+        # instead of waiting for the current file's Whisper transcription
+        # to complete (which can be many minutes for long audio).
+        import time as _time
+        while proc.poll() is None:
+            if _cancel_event.is_set():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                return
+            _time.sleep(0.2)
+
     t_out = threading.Thread(target=_drain_stdout, daemon=True)
     t_err = threading.Thread(target=_drain_stderr, daemon=True)
+    t_cancel = threading.Thread(target=_cancel_watcher, daemon=True)
     t_out.start()
     t_err.start()
+    t_cancel.start()
 
     proc.wait()
     t_out.join(timeout=2)
     t_err.join(timeout=2)
+    # _cancel_watcher exits on its own once proc.poll() returns non-None.
 
     return proc.returncode, "".join(stdout_chunks), "".join(stderr_chunks)
 
@@ -679,6 +712,10 @@ def proceed_multifile_whisperthread():
         save_all_apikeys()
         settingjson(transferuiwrapper)
         for i, (file, spath) in enumerate(file_list):
+            if _cancel_event.is_set():
+                append_runtime_log(f"Multifile cancelled by user at item {i + 1}/{len(file_list)}")
+                multifile_queue.put(("text", localization.getstr('cancelled')))
+                break
             append_runtime_log(f"Starting multifile item {i + 1}/{len(file_list)}: {file}")
             list_label_indicate(i+1)
             append_runtime_log(f"Updated list label for multifile item {i + 1}/{len(file_list)}")
@@ -849,7 +886,11 @@ def multifile_update_from_queue():
             all_done = multifile_list_label['text'].split("/")[0] == str(len(file_list))
             if all_done:
                 multifile_status_label['text'] = "Finished"
-            multifile_generation_button.config(state=NORMAL)
+            # Restore the Generate ↔ Cancel toggle to its idle state on
+            # BOTH buttons regardless of which mode just finished —
+            # otherwise the user-cancelled multifile button could be
+            # stuck on "취소 중..." after the worker thread exits.
+            _reset_generate_buttons()
             multifile_progressbar['value'] = 0
             check_multifile_status()
             file_treeview.bind('<Delete>', on_delete_key_press)
@@ -902,7 +943,7 @@ def update_ui_from_queue():
     if finished:
         with lock:
             percentagelabel['text'] = "Finished"
-            proceedbutton.config(state=NORMAL)
+            _reset_generate_buttons()
             progressbar['value'] = 0
         return
 
@@ -949,6 +990,43 @@ def initialize():
         local_temperature_var.set(str(saved_local_temperature))
 
 
+def request_cancel():
+    """Mark the running job as cancelled. The worker thread sees this at
+    the next checkpoint and shuts down — between files in the multifile
+    loop, between batches in translate_subtitle_lines, between retries in
+    the Local LLM / Claude wrappers. The subprocess worker is also killed
+    immediately by the cancel watcher inside _run_worker_with_progress.
+
+    The button is disabled and switched to "취소 중..." while cancellation
+    propagates; the Finished handler restores it to "자막생성" when the
+    worker thread actually exits."""
+    if not _cancel_event.is_set():
+        _cancel_event.set()
+        append_runtime_log("User requested cancellation")
+    try:
+        proceedbutton.config(state=DISABLED, text=localization.getstr('cancelling'))
+    except Exception:
+        pass
+    try:
+        multifile_generation_button.config(state=DISABLED, text=localization.getstr('cancelling'))
+    except Exception:
+        pass
+
+
+def _reset_generate_buttons():
+    """Restore both Generate buttons to their idle state. Called from the
+    Finished handler regardless of whether the job ended naturally or via
+    cancel — same UI outcome either way."""
+    try:
+        proceedbutton.config(state=NORMAL, text=localization.getstr('generate'), command=proceed)
+    except Exception:
+        pass
+    try:
+        multifile_generation_button.config(state=NORMAL, text=localization.getstr('generate'), command=proceedmultifile)
+    except Exception:
+        pass
+
+
 def proceed():
     target_file = targetfileEntry.get().strip()
     if not target_file or not os.path.exists(target_file):
@@ -957,7 +1035,13 @@ def proceed():
     if not is_supported_media(target_file):
         show_unsupported_media_message([target_file])
         return
-    proceedbutton.config(state=DISABLED)
+    # Fresh cancellation slate every run.
+    _cancel_event.clear()
+    # Generate -> Cancel toggle. Keeps the button enabled so the user can
+    # actually stop a long job; multifile button is disabled to prevent
+    # starting two jobs at once.
+    proceedbutton.config(text=localization.getstr('cancel'), command=request_cancel)
+    multifile_generation_button.config(state=DISABLED)
     update_ui_from_queue()
     thread = threading.Thread(target=proceedfastwhisperthread)
     thread.start()
@@ -976,7 +1060,10 @@ def proceedmultifile():
         return
 
     multi_processing = True
-    multifile_generation_button.config(state=DISABLED)
+    _cancel_event.clear()
+    # Same Generate -> Cancel toggle pattern as single-file mode.
+    multifile_generation_button.config(text=localization.getstr('cancel'), command=request_cancel)
+    proceedbutton.config(state=DISABLED)
     file_treeview.unbind('<Delete>')
     multifile_update_from_queue()
     thread = threading.Thread(target=proceed_multifile_whisperthread)

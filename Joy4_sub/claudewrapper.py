@@ -254,6 +254,15 @@ def translateusingclaude(text, uiwrapper, _plan=None, _exhausted=None):
     Only after both configured plans are exhausted does it surface the wait-or-cancel dialog.
     """
     try:
+        # Cancel checkpoint on entry. This guards each Claude batch call
+        # AND each plan-failover recursion (the function calls itself with
+        # the other plan on rate limit). Mid-claude.exe-run cancellation
+        # isn't supported — that's a 30+ second subprocess we can't easily
+        # signal — but bailing here keeps the user out of additional batches.
+        if hasattr(uiwrapper, 'is_cancelled') and uiwrapper.is_cancelled():
+            append_runtime_log("Claude CLI cancelled by user before dispatch")
+            return None
+
         target_lang = uiwrapper.get_trglanguagecodeinput().strip()
 
         if not target_lang:
