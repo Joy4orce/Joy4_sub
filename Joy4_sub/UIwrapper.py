@@ -7,7 +7,8 @@ class UIwrapper:
                  claude_pro_token="", claude_team_token="", claude_default_plan="pro",
                  local_endpoint="", local_model="", local_system_prompt="",
                  local_temperature=0.1, local_apikey="",
-                 cancel_event=None):
+                 cancel_event=None,
+                 translate_filenames=False):
         self.queue = queue
         self.lock = lock
         self.key = key  # legacy: active engine's keys (kept for compat)
@@ -36,6 +37,10 @@ class UIwrapper:
         # so any cooperative checkpoint (batch boundary, retry attempt,
         # per-line call) can bail out cleanly when the user hits Cancel.
         self.cancel_event = cancel_event
+        # Persisted by settings.settingjson and reloaded by initialize().
+        # When True, multifile/single-file workers will rename media + srt
+        # to the engine's translation of any Japanese basename.
+        self.translate_filenames = translate_filenames
 
     def is_cancelled(self):
         """True when the user has requested cancellation. Cheap to call —
