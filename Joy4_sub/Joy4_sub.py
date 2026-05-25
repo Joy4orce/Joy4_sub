@@ -386,11 +386,47 @@ def _batch_translate_filenames(file_list_snapshot, uiwrapper):
     }
 
 
+# Sibling subtitle / sidecar files that follow the convention
+# "<media basename>[suffix]<extension>" and should be renamed in lockstep
+# with the media file. Without this, only .srt would move to the new
+# name and other sidecars (transcribed _original.srt from the
+# "원본자막도 생성" option, .vtt from external tools, .ass/.smi/.sbv
+# from manual edits) would stay with the old Japanese basename — pairing
+# silently broken even though the user sees the media renamed correctly.
+#
+# Order doesn't matter; we walk the cross product and skip non-existent
+# combinations. The empty suffix covers the canonical translated subtitle;
+# "_original" covers the transcribed sidecar (see mywhisper.py).
+_SUBTITLE_SUFFIXES = ("", "_original")
+_SUBTITLE_EXTENSIONS = (".srt", ".vtt", ".ass", ".ssa", ".smi", ".sbv")
+
+
+def _find_sibling_subtitles(media_path):
+    """Return [(suffix, ext)] for every subtitle / sidecar file that
+    currently exists next to `media_path` and follows our naming
+    convention. Used by the rename flow to keep the whole sibling set
+    paired with the renamed media."""
+    base_noext = os.path.splitext(media_path)[0]
+    found = []
+    for suffix in _SUBTITLE_SUFFIXES:
+        for ext in _SUBTITLE_EXTENSIONS:
+            if os.path.exists(base_noext + suffix + ext):
+                found.append((suffix, ext))
+    return found
+
+
 def _rename_pair_for_file(media_path, new_basename):
-    """Rename media file and its sibling .srt to share `new_basename`.
-    Skips silently if the new basename equals the old one (no-op) or the
-    media file no longer exists. Conflicts are resolved by appending
-    ` (n)`. Returns the new media path on success, None on no-op/failure."""
+    """Rename a media file AND every sibling subtitle/sidecar that
+    follows the "<basename>[suffix]<ext>" convention to share
+    `new_basename`. This keeps translated SRT, transcribed _original.srt,
+    .vtt and other subtitle formats all paired with the renamed media —
+    if we only renamed .srt, the others would silently lose their
+    pairing.
+
+    No-op if new_basename equals the current one. Returns the new media
+    path on success, None on no-op / media-missing / rename-error.
+    Individual sibling failures are logged but don't roll back the media
+    rename (we accept partial success over an inconsistent rollback)."""
     if not new_basename:
         return None
     directory = os.path.dirname(media_path)
@@ -401,10 +437,13 @@ def _rename_pair_for_file(media_path, new_basename):
         append_runtime_log(f"Filename rename skipped (media missing): {media_path}")
         return None
 
+    # Snapshot the sibling set BEFORE renaming so the old paths still
+    # resolve when we walk them after the media rename.
+    siblings = _find_sibling_subtitles(media_path)
+    old_base_noext = os.path.splitext(media_path)[0]
+
     new_media_path = _resolve_unique_path(directory, new_basename, ext)
-    # Derive the SRT path from the new media path so the pair stays together.
     new_base_noext = os.path.splitext(new_media_path)[0]
-    old_srt_path = os.path.splitext(media_path)[0] + ".srt"
 
     try:
         os.rename(media_path, new_media_path)
@@ -414,17 +453,26 @@ def _rename_pair_for_file(media_path, new_basename):
         )
         return None
 
-    if os.path.exists(old_srt_path):
-        new_srt_path = new_base_noext + ".srt"
+    renamed_subs = 0
+    for suffix, sub_ext in siblings:
+        old_sub = old_base_noext + suffix + sub_ext
+        new_sub = new_base_noext + suffix + sub_ext
+        if not os.path.exists(old_sub):
+            # Defensive: file disappeared between snapshot and now.
+            continue
         try:
-            os.rename(old_srt_path, new_srt_path)
+            os.rename(old_sub, new_sub)
+            renamed_subs += 1
         except Exception as exc:
             append_runtime_log(
-                f"Filename rename failed for srt {old_srt_path}: {type(exc).__name__}: {exc}"
+                f"Filename rename failed for sibling {old_sub}: "
+                f"{type(exc).__name__}: {exc}"
             )
-            # Media already renamed; the SRT pair is now broken. Log and continue.
 
-    append_runtime_log(f"Renamed: {media_path} -> {new_media_path}")
+    append_runtime_log(
+        f"Renamed: {media_path} -> {new_media_path} "
+        f"(+ {renamed_subs} sibling subtitle file{'s' if renamed_subs != 1 else ''})"
+    )
     return new_media_path
 multifile_status_indicator = 0
 supported_media_extensions = set(get_supported_media_extensions())
@@ -726,8 +774,10 @@ def proceedfastwhisperthread():
     if (translate_filenames_var.get()
             and not _cancel_event.is_set()
             and _has_japanese(os.path.splitext(os.path.basename(targetfile))[0])):
-        srt_path = os.path.splitext(targetfile)[0] + ".srt"
-        if os.path.exists(srt_path):
+        # Trigger on any sibling subtitle (translated .srt, transcribed
+        # _original.srt, .vtt, etc.), not just .srt — matches the multifile
+        # path so an "original-only" run still gets its filename translated.
+        if _find_sibling_subtitles(targetfile):
             try:
                 rename_map = _batch_translate_filenames(
                     [(targetfile, targetfile)], transferuiwrapper
@@ -984,18 +1034,21 @@ def proceed_multifile_whisperthread():
                     break
             append_runtime_log(f"Returned from worker for multifile item {i + 1}/{len(file_list)}: {file}")
             append_runtime_log(f"Finished multifile item {i + 1}/{len(file_list)}: {file}")
-            # Rename media + srt to translated basename, if this file was
-            # in the pre-batched rename map AND the .srt was actually
-            # produced. The disk check inside _rename_pair_for_file
-            # prevents renaming when the media file is somehow gone.
+            # Rename media + all sibling subtitle/sidecar files to the
+            # pre-batched translated basename. Trigger condition: ANY
+            # subtitle sibling exists (translated .srt, transcribed
+            # _original.srt, .vtt, etc.) — that means transcription
+            # produced at least one output worth keeping paired with
+            # the media. If none exist, the run failed before producing
+            # subtitles and we skip the rename so the user can retry
+            # with the original filename.
             new_basename = filename_rename_map.get(file)
             if new_basename:
-                srt_path = os.path.splitext(file)[0] + ".srt"
-                if os.path.exists(srt_path):
+                if _find_sibling_subtitles(file):
                     _rename_pair_for_file(file, new_basename)
                 else:
                     append_runtime_log(
-                        f"Filename rename skipped (srt not produced): {file}"
+                        f"Filename rename skipped (no subtitle siblings produced): {file}"
                     )
             # Signal the UI consumer to refresh the Status column for this
             # file. We don't pass the path — check_multifile_status walks the
