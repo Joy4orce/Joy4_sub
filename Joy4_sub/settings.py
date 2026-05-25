@@ -207,6 +207,7 @@ def settingjson(uiwrapper):
         "gemini_model": getattr(uiwrapper, 'gemini_model', '') or '',
         "openai_model": getattr(uiwrapper, 'openai_model', '') or '',
         "claude_default_plan": getattr(uiwrapper, 'claude_default_plan', 'pro') or 'pro',
+        "translate_filenames": getattr(uiwrapper, 'translate_filenames', False),
         "local_endpoint": getattr(uiwrapper, 'local_endpoint', '') or '',
         "local_model": getattr(uiwrapper, 'local_model', '') or '',
         "local_system_prompt": getattr(uiwrapper, 'local_system_prompt', '') or '',

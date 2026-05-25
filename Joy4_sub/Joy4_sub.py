@@ -176,6 +176,12 @@ fast_var = tkinter.BooleanVar(value=True)
 
 translation_engine_var = tkinter.StringVar(value="DeepL")
 
+# Opt-in: when ON, rename every media file whose basename contains
+# Japanese characters to its translated form after that file's SRT
+# is generated. Default OFF because rename is destructive and the
+# user can't easily undo a bad batch of renames.
+translate_filenames_var = tkinter.BooleanVar(value=False)
+
 # Per-engine model selection
 gemini_model_var = tkinter.StringVar(value="gemini-2.0-flash")
 openai_model_var = tkinter.StringVar(value="gpt-4o-mini")
@@ -297,6 +303,129 @@ def get_local_apikey_input():
         return ""
 
 file_list= []
+
+# Japanese Unicode blocks: Hiragana + Katakana + CJK Unified Ideographs +
+# Halfwidth Katakana. Anything matching means the filename is at least
+# partially Japanese and is a candidate for translation. Other CJK scripts
+# (full Korean, full Chinese without Japanese kana) are deliberately not
+# matched — those are usually already in the user's preferred form.
+_JAPANESE_CHAR_RE = re.compile(r'[぀-ゟ゠-ヿ一-鿿ｦ-ﾟ]')
+
+# Characters Windows refuses in filenames + ASCII control chars.
+_WINDOWS_ILLEGAL_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+
+
+def _has_japanese(text):
+    return bool(_JAPANESE_CHAR_RE.search(text or ""))
+
+
+def _sanitize_windows_filename(name):
+    """Strip filesystem-illegal characters, collapse whitespace, trim
+    trailing dots/spaces (which Windows silently drops). Always returns
+    a non-empty string — falls back to 'untitled' if everything was
+    stripped away."""
+    sanitized = _WINDOWS_ILLEGAL_RE.sub('_', name or '').strip()
+    sanitized = re.sub(r'\s+', ' ', sanitized).rstrip('. ')
+    return sanitized or "untitled"
+
+
+def _resolve_unique_path(directory, basename, extension):
+    """Return a path that doesn't collide with anything already on disk.
+    If `directory/basename<extension>` is free, returns that; otherwise
+    appends ` (1)`, ` (2)`, ... until it finds an unused slot."""
+    candidate = os.path.join(directory, basename + extension)
+    if not os.path.exists(candidate):
+        return candidate
+    for n in range(1, 1000):
+        candidate = os.path.join(directory, f"{basename} ({n}){extension}")
+        if not os.path.exists(candidate):
+            return candidate
+    # Extremely unlikely fallback
+    return os.path.join(directory, f"{basename}_{os.getpid()}{extension}")
+
+
+def _batch_translate_filenames(file_list_snapshot, uiwrapper):
+    """Translate every Japanese-containing basename in the file list with
+    one dispatch_translate call. Returns {original_path: sanitized_new_basename}.
+    Empty dict on any failure — caller falls back to keeping originals."""
+    targets_paths = []
+    targets_basenames = []
+    for path, _spath in file_list_snapshot:
+        basename = os.path.splitext(os.path.basename(path))[0]
+        if _has_japanese(basename):
+            targets_paths.append(path)
+            targets_basenames.append(basename)
+
+    if not targets_basenames:
+        return {}
+
+    append_runtime_log(
+        f"Filename translation: {len(targets_basenames)} Japanese filenames "
+        f"to translate via {uiwrapper.get_translation_engine()}"
+    )
+
+    try:
+        from mywhisper import dispatch_translate
+        translated = dispatch_translate(targets_basenames, uiwrapper)
+    except Exception as exc:
+        append_runtime_log(
+            f"Filename batch translation failed: {type(exc).__name__}: {exc}"
+        )
+        return {}
+
+    if not translated or len(translated) != len(targets_basenames):
+        append_runtime_log(
+            f"Filename translation count mismatch "
+            f"(got {len(translated or [])}, expected {len(targets_basenames)}); skipping renames"
+        )
+        return {}
+
+    return {
+        path: _sanitize_windows_filename(t)
+        for path, t in zip(targets_paths, translated)
+    }
+
+
+def _rename_pair_for_file(media_path, new_basename):
+    """Rename media file and its sibling .srt to share `new_basename`.
+    Skips silently if the new basename equals the old one (no-op) or the
+    media file no longer exists. Conflicts are resolved by appending
+    ` (n)`. Returns the new media path on success, None on no-op/failure."""
+    if not new_basename:
+        return None
+    directory = os.path.dirname(media_path)
+    old_basename, ext = os.path.splitext(os.path.basename(media_path))
+    if new_basename == old_basename:
+        return None
+    if not os.path.exists(media_path):
+        append_runtime_log(f"Filename rename skipped (media missing): {media_path}")
+        return None
+
+    new_media_path = _resolve_unique_path(directory, new_basename, ext)
+    # Derive the SRT path from the new media path so the pair stays together.
+    new_base_noext = os.path.splitext(new_media_path)[0]
+    old_srt_path = os.path.splitext(media_path)[0] + ".srt"
+
+    try:
+        os.rename(media_path, new_media_path)
+    except Exception as exc:
+        append_runtime_log(
+            f"Filename rename failed for media {media_path}: {type(exc).__name__}: {exc}"
+        )
+        return None
+
+    if os.path.exists(old_srt_path):
+        new_srt_path = new_base_noext + ".srt"
+        try:
+            os.rename(old_srt_path, new_srt_path)
+        except Exception as exc:
+            append_runtime_log(
+                f"Filename rename failed for srt {old_srt_path}: {type(exc).__name__}: {exc}"
+            )
+            # Media already renamed; the SRT pair is now broken. Log and continue.
+
+    append_runtime_log(f"Renamed: {media_path} -> {new_media_path}")
+    return new_media_path
 multifile_status_indicator = 0
 supported_media_extensions = set(get_supported_media_extensions())
 
@@ -374,26 +503,26 @@ def on_delete_key_press(event):
     multifile_list_label['text'] = "0/" + str(len(file_list))
 
 def check_multifile_status():
-    # Build the spath -> path map once (O(N)) instead of doing a linear
-    # scan inside the per-item loop (O(N²)). For a 267-file batch on a
-    # slow drive this cut the function from ~3 seconds to <500 ms — the
-    # old O(N²) version was the real reason the UI looked frozen after
-    # PR #6's drain fix: every drained "list" message triggered another
-    # multi-second walk on the main Tk thread.
+    # Build the spath -> path map once (O(N)) instead of scanning the
+    # whole file_list inside each row.
     #
-    # Also skip the treeview update when the status hasn't actually
-    # changed; row updates trigger redraws and add up across 267 items.
+    # Skip rows already marked Done: the .srt won't disappear mid-batch,
+    # so once Done they stay Done. As the batch progresses, the disk-check
+    # workload on subsequent calls shrinks toward O(remaining_undone) —
+    # the very last call only touches rows that genuinely haven't been
+    # processed yet.
     path_by_spath = {spath: path for path, spath in file_list}
 
     for item in file_treeview.get_children():
         item_value = list(file_treeview.item(item, 'values'))
+        if len(item_value) >= 4 and item_value[3] == "Done":
+            continue
         path = path_by_spath.get(item_value[0])
         if path is None:
             continue
         base, _ = os.path.splitext(path)
-        new_status = "Done" if os.path.exists(base + ".srt") else "Undone"
-        if item_value[3] != new_status:
-            item_value[3] = new_status
+        if os.path.exists(base + ".srt"):
+            item_value[3] = "Done"
             file_treeview.item(item, values=tuple(item_value))
 
 def list_label_indicate( number = 0):
@@ -565,6 +694,7 @@ def proceedfastwhisperthread():
         local_temperature=get_local_temperature_input(),
         local_apikey=get_local_apikey_input(),
         cancel_event=_cancel_event,
+        translate_filenames=translate_filenames_var.get(),
     )
     save_all_apikeys()
     settingjson(transferuiwrapper)
@@ -589,6 +719,26 @@ def proceedfastwhisperthread():
         update_queue.put(("text", "Finished"))
     release_retained_cuda_models()
     append_runtime_log(f"Finished single file job: {targetfile}")
+
+    # Single-file filename rename — same opt-in behavior as multifile mode.
+    # Skip if the user cancelled (the .srt may be partial / missing) or if
+    # the filename has no Japanese characters.
+    if (translate_filenames_var.get()
+            and not _cancel_event.is_set()
+            and _has_japanese(os.path.splitext(os.path.basename(targetfile))[0])):
+        srt_path = os.path.splitext(targetfile)[0] + ".srt"
+        if os.path.exists(srt_path):
+            try:
+                rename_map = _batch_translate_filenames(
+                    [(targetfile, targetfile)], transferuiwrapper
+                )
+                new_basename = rename_map.get(targetfile)
+                if new_basename:
+                    _rename_pair_for_file(targetfile, new_basename)
+            except Exception as exc:
+                append_runtime_log(
+                    f"Single-file filename rename failed: {type(exc).__name__}: {exc}"
+                )
 
 # Worker subprocess emits progress events to stdout prefixed with this
 # sentinel. _run_worker_with_progress() peels them off and forwards them
@@ -711,6 +861,28 @@ def proceed_multifile_whisperthread():
         )
         save_all_apikeys()
         settingjson(transferuiwrapper)
+
+        # If filename translation is enabled, batch-translate all Japanese
+        # basenames up front in ONE engine call. 267 files of Claude
+        # Haiku batched cost ~one extra call instead of 267 individual
+        # calls. Result is a path -> new_basename map; missing or
+        # non-Japanese entries are left out and stay as their originals.
+        filename_rename_map = {}
+        if translate_filenames_var.get():
+            multifile_queue.put(("text", localization.getstr('translating_filenames')))
+            try:
+                filename_rename_map = _batch_translate_filenames(
+                    list(file_list), transferuiwrapper
+                )
+                append_runtime_log(
+                    f"Filename rename map: {len(filename_rename_map)} entries prepared"
+                )
+            except Exception as exc:
+                append_runtime_log(
+                    f"Filename pre-batch failed: {type(exc).__name__}: {exc}"
+                )
+                filename_rename_map = {}
+
         for i, (file, spath) in enumerate(file_list):
             if _cancel_event.is_set():
                 append_runtime_log(f"Multifile cancelled by user at item {i + 1}/{len(file_list)}")
@@ -812,6 +984,25 @@ def proceed_multifile_whisperthread():
                     break
             append_runtime_log(f"Returned from worker for multifile item {i + 1}/{len(file_list)}: {file}")
             append_runtime_log(f"Finished multifile item {i + 1}/{len(file_list)}: {file}")
+            # Rename media + srt to translated basename, if this file was
+            # in the pre-batched rename map AND the .srt was actually
+            # produced. The disk check inside _rename_pair_for_file
+            # prevents renaming when the media file is somehow gone.
+            new_basename = filename_rename_map.get(file)
+            if new_basename:
+                srt_path = os.path.splitext(file)[0] + ".srt"
+                if os.path.exists(srt_path):
+                    _rename_pair_for_file(file, new_basename)
+                else:
+                    append_runtime_log(
+                        f"Filename rename skipped (srt not produced): {file}"
+                    )
+            # Signal the UI consumer to refresh the Status column for this
+            # file. We don't pass the path — check_multifile_status walks the
+            # treeview and skips rows already marked Done, so it stays cheap
+            # as the batch progresses. Emitted regardless of success/failure;
+            # the disk check inside the refresher decides Done vs leave-alone.
+            multifile_queue.put(("__file_done__", None))
         release_retained_cuda_models()
         append_runtime_log("Released retained CUDA models after multifile batch")
     except Exception as exc:
@@ -845,6 +1036,7 @@ def multifile_update_from_queue():
     latest = {}
     rate_limit_payload = None
     finished = False
+    file_done_pending = False
     drained = 0
     DRAIN_CAP = 500  # safety: never starve the Tk main loop on a flood
 
@@ -862,6 +1054,11 @@ def multifile_update_from_queue():
             # finally block after the for-loop has finished (or been
             # cancelled). Consumer exits here.
             finished = True
+        elif kind == "__file_done__":
+            # One file just completed (success or failure). Defer the
+            # treeview status refresh until after the drain so multiple
+            # file completions in the same tick coalesce into one walk.
+            file_done_pending = True
         elif kind == "text" and val == "Finished":
             # Per-file leak from inner transcribe functions. Inner
             # transcribe emits ("text", "Finished") at the end of each
@@ -892,6 +1089,14 @@ def multifile_update_from_queue():
     if "text" in latest:
         with lock:
             multifile_status_label['text'] = latest["text"]
+
+    if file_done_pending:
+        with lock:
+            # Refresh the Status column. The function skips rows already
+            # Done so per-call cost shrinks across the batch — only the
+            # still-undone rows incur a disk check. Coalesced when multiple
+            # files complete in the same drain tick.
+            check_multifile_status()
 
     if rate_limit_payload is not None:
         _show_rate_limit_dialog(rate_limit_payload)
@@ -990,6 +1195,7 @@ def initialize():
     saved_claude_default_plan = (settings.get("claude_default_plan", "pro") or "pro").lower()
     if saved_claude_default_plan in ("pro", "team"):
         claude_default_plan_var.set(saved_claude_default_plan)
+    translate_filenames_var.set(bool(settings.get("translate_filenames", False)))
     saved_local_endpoint = settings.get("local_endpoint", "")
     if saved_local_endpoint:
         local_endpoint_var.set(saved_local_endpoint)
@@ -1174,6 +1380,12 @@ Radiobutton(engine_frame, text="Local LLM", variable=translation_engine_var, val
             command=lambda: on_engine_change()).grid(column=5, row=0, padx=2)
 Label(engine_frame, text=localization.getstr('apikey_multiline_hint'), fg="#666"
       ).grid(column=0, row=1, columnspan=6, sticky='w', pady=(4, 0))
+# Filename translation toggle. Sits on its own row under the engine
+# selector since it's a translation-behavior switch, not an engine
+# pick. Applies to both single-file and multifile modes.
+Checkbutton(engine_frame, text=localization.getstr('translate_filenames'),
+            variable=translate_filenames_var
+            ).grid(column=0, row=2, columnspan=6, sticky='w', pady=(2, 0))
 
 # Row 5 — primary action: generate + original-too checkbox
 frame3 = Frame(form_frame)
