@@ -4,6 +4,8 @@ from imageio_ffmpeg import get_ffmpeg_exe
 import wave
 import subprocess
 import os
+import re
+import sys
 
 SUPPORTED_AUDIO_EXTENSIONS = (
     ".mp3", ".wav", ".aac", ".m4a", ".flac", ".ogg", ".wma", ".opus", ".weba"
@@ -58,19 +60,40 @@ def get_media_length_in_time(file_path):
     minutes, seconds = divmod(remainder, 60)
     return f"{hours}:{minutes}:{seconds}"
 
+def _probe_duration_with_ffmpeg(file_path):
+    """Duration (seconds) via the bundled ffmpeg, parsing the
+    'Duration: HH:MM:SS.ss' line from `ffmpeg -i` stderr.
+
+    Replaces the old moviepy AudioFileClip/VideoFileClip probe, which raised
+    (and spewed 'FFMPEG_AudioReader.__del__ ... has no attribute proc' noise)
+    on many perfectly playable real-world files — non-RIFF .wav exports and
+    mp3s whose ffmpeg banner moviepy's regex couldn't parse. ffmpeg itself
+    reads all of those fine, so probing with it directly is both quieter and
+    far more reliable. Returns 0.0 when the duration can't be determined."""
+    ffmpeg_path = get_ffmpeg_exe()
+    kwargs = dict(capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    # `ffmpeg -i` with no output file exits non-zero by design; we only want
+    # the informational banner it writes to stderr.
+    completed = subprocess.run([ffmpeg_path, "-i", file_path], **kwargs)
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", completed.stderr or "")
+    if not match:
+        return 0.0
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
 def get_media_length_in_seconds(file_path):
+    # Fast path for standard RIFF .wav via the stdlib (no subprocess), but fall
+    # back to the ffmpeg probe when the header isn't RIFF (some tools export
+    # .wav that Python's wave module rejects yet ffmpeg plays fine).
     if get_file_extension(file_path) == ".wav":
-        return get_wav_length_in_seconds(file_path)
-
-    if is_audio(file_path):
-        clip = AudioFileClip(file_path)
-    else:
-        clip = VideoFileClip(file_path)
-
-    try:
-        return float(clip.duration)
-    finally:
-        clip.close()
+        try:
+            return get_wav_length_in_seconds(file_path)
+        except Exception:
+            pass
+    return _probe_duration_with_ffmpeg(file_path)
 
 def is_audio(file_path):
     return get_file_extension(file_path) in SUPPORTED_AUDIO_EXTENSIONS

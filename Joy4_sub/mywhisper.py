@@ -42,6 +42,28 @@ def append_runtime_log(message):
         log_file.write(f"[{timestamp}] {message}\n")
 
 
+def _safe_media_seconds(file):
+    """Media duration in seconds, for progress-bar scaling ONLY. Never raises.
+
+    Some real files fail duration probing yet still transcribe fine via
+    faster-whisper's own decoder: non-RIFF .wav files (Python's wave module
+    rejects them) and mp3s whose ffmpeg stderr moviepy can't parse. Previously
+    the raised exception here crashed the whole worker before any subtitle was
+    written, which — combined with the multifile loop aborting on the first
+    worker failure — made an entire batch "complete nothing". Returns 0.0 on
+    failure; callers MUST treat 0 as "unknown" and never divide by it.
+    """
+    try:
+        seconds = get_media_length_in_seconds(file)
+        return seconds if seconds and seconds > 0 else 0.0
+    except Exception as exc:
+        append_runtime_log(
+            f"Media length probe failed for {file}: {type(exc).__name__}: {exc}; "
+            f"progress bar will be approximate"
+        )
+        return 0.0
+
+
 def clear_gpu_memory():
     gc.collect()
     if torch.cuda.is_available():
@@ -278,8 +300,8 @@ def transcribe_fast_whisper(file, option, uiwrapper, output_base=None):
                 condition_on_previous_text=False,
             )
 
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
+        allseconds = _safe_media_seconds(file)
+        uiwrapper.update_progressbar("maximum", allseconds or 1)
 
         if os.path.exists(srtfile):
             os.remove(srtfile)
@@ -295,7 +317,7 @@ def transcribe_fast_whisper(file, option, uiwrapper, output_base=None):
                             f"{index}\n{format_seconds(segment.start)} --> {format_seconds(segment.end)}\n{translated_string}\n\n"
                         )
                     uiwrapper.update_progressbar("value", segment.end)
-                    uiwrapper.update_percentagelabel_post("text", "{:.2f}%".format((segment.end / allseconds) * 100))
+                    uiwrapper.update_percentagelabel_post("text", "{:.2f}%".format((segment.end / allseconds) * 100) if allseconds else "Transcribing...")
         except ClaudeRateLimitError:
             if os.path.exists(srtfile):
                 os.remove(srtfile)
@@ -343,8 +365,8 @@ def transcribe_fast_whisper_differently(file, option, uiwrapper, output_base=Non
                 condition_on_previous_text=False,
             )
 
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
+        allseconds = _safe_media_seconds(file)
+        uiwrapper.update_progressbar("maximum", allseconds or 1)
 
         with open(transcribedsrtfile, "w", encoding="utf8") as srt_output:
             for index, segment in enumerate(segments, start=1):
@@ -354,7 +376,7 @@ def transcribe_fast_whisper_differently(file, option, uiwrapper, output_base=Non
                     f"{index}\n{format_seconds(segment.start)} --> {format_seconds(segment.end)}\n{segment.text.strip()}\n\n"
                 )
                 uiwrapper.update_progressbar("value", segment.end)
-                uiwrapper.update_percentagelabel_post("text", "{:.2f}%".format((segment.end / allseconds) * 100))
+                uiwrapper.update_percentagelabel_post("text", "{:.2f}%".format((segment.end / allseconds) * 100) if allseconds else "Transcribing...")
 
         append_runtime_log(f"Finished transcription stage for {file}")
         uiwrapper.update_percentagelabel_post("text", "Transcription done, starting translation...")
@@ -411,8 +433,8 @@ def transcribe_whisper(file, option, uiwrapper, output_base=None):
         writer = get_writer("srt", os.path.dirname(transcribedsrtfile) or ".")
         writer(result, transcribedsrtfile)
 
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
+        allseconds = _safe_media_seconds(file)
+        uiwrapper.update_progressbar("maximum", allseconds or 1)
 
         append_runtime_log(f"Finished whisper transcription stage for {file}")
         uiwrapper.update_percentagelabel_post("text", "Transcription done, starting translation...")
@@ -476,8 +498,8 @@ def transcribe_stable_whisper(file, option, uiwrapper, output_base=None):
             )
         result.to_srt_vtt(transcribedsrtfile, word_level=False)
 
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
+        allseconds = _safe_media_seconds(file)
+        uiwrapper.update_progressbar("maximum", allseconds or 1)
 
         append_runtime_log(f"Finished stable whisper transcription stage for {file}")
         uiwrapper.update_percentagelabel_post("text", "Transcription done, starting translation...")

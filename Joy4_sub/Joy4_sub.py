@@ -475,6 +475,10 @@ def _rename_pair_for_file(media_path, new_basename):
     )
     return new_media_path
 multifile_status_indicator = 0
+# Full paths of files whose worker failed during the current batch. Read by
+# check_multifile_status() (main thread) to mark those rows "Fail" instead of
+# leaving them stuck on "Undone". Cleared at the start of each batch run.
+multifile_failed_paths = set()
 supported_media_extensions = set(get_supported_media_extensions())
 
 
@@ -563,7 +567,7 @@ def check_multifile_status():
 
     for item in file_treeview.get_children():
         item_value = list(file_treeview.item(item, 'values'))
-        if len(item_value) >= 4 and item_value[3] == "Done":
+        if len(item_value) >= 4 and item_value[3] in ("Done", "Fail"):
             continue
         path = path_by_spath.get(item_value[0])
         if path is None:
@@ -571,6 +575,12 @@ def check_multifile_status():
         base, _ = os.path.splitext(path)
         if os.path.exists(base + ".srt"):
             item_value[3] = "Done"
+            file_treeview.item(item, values=tuple(item_value))
+        elif path in multifile_failed_paths:
+            # Worker crashed on this file (e.g. unreadable/corrupt media).
+            # Surface it as Fail so the user can see WHICH files were skipped
+            # instead of them sitting on "Undone" forever.
+            item_value[3] = "Fail"
             file_treeview.item(item, values=tuple(item_value))
 
 def list_label_indicate( number = 0):
@@ -912,6 +922,10 @@ def proceed_multifile_whisperthread():
         save_all_apikeys()
         settingjson(transferuiwrapper)
 
+        # Fresh batch → clear last run's failures so stale "Fail" rows don't
+        # carry over into this run's status display.
+        multifile_failed_paths.clear()
+
         # If filename translation is enabled, batch-translate all Japanese
         # basenames up front in ONE engine call. 267 files of Claude
         # Haiku batched cost ~one extra call instead of 267 individual
@@ -1010,7 +1024,13 @@ def proceed_multifile_whisperthread():
                             rate_limit_cancelled = True
                             break
                     elif returncode != 0:
-                        multifile_queue.put(("text", f"Worker failed: {os.path.basename(file)}"))
+                        # A single unreadable/corrupt file (e.g. non-RIFF .wav,
+                        # an mp3 ffmpeg can't parse) must NOT abort the whole
+                        # batch. Record it as failed, tell the user, and move on
+                        # to the next file so the remaining ones still process.
+                        multifile_failed_paths.add(file)
+                        append_runtime_log(f"Worker failed for {file}; marking Fail and continuing")
+                        multifile_queue.put(("text", f"Worker failed (skipping): {os.path.basename(file)}"))
                         break
                     else:
                         break
