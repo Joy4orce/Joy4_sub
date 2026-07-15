@@ -599,22 +599,16 @@ def on_filetap_drop(event):
 
 
 def on_drop(event):
-    dropped_files = split_dnd_files(event.data)
-    unsupported_files = [file for file in dropped_files if not is_supported_media(file)]
-    supported_files = [file for file in dropped_files if is_supported_media(file)]
-
-    if unsupported_files:
-        show_unsupported_media_message(unsupported_files)
-
-    existing_paths = {os.path.normcase(os.path.abspath(p)) for p, _ in file_list}
-    for file_path in supported_files:
-        norm = os.path.normcase(os.path.abspath(file_path))
-        if norm in existing_paths:
-            continue
-        existing_paths.add(norm)
-        add_media_file_to_list(file_path)
-
-    multifile_list_label['text'] = "0/" + str(len(file_list))
+    # Accepts BOTH files and folders. Dropped folders are expanded recursively
+    # (same as the "Add Folder" button), so all four add methods are supported.
+    dropped = split_dnd_files(event.data)
+    added, duplicates, skipped_existing, unsupported = _ingest_media_paths(dropped)
+    append_runtime_log(
+        f"Drag-drop: {added} added, {duplicates} duplicate(s), "
+        f"{skipped_existing} already-subtitled skipped"
+    )
+    if unsupported:
+        show_unsupported_media_message(unsupported)
 
 
 def _collect_media_files_recursively(folder_path):
@@ -651,6 +645,69 @@ def _has_existing_subtitle(media_path):
     return any(os.path.exists(c) for c in candidates)
 
 
+def _ingest_media_paths(paths):
+    """Add a mix of files and folders to the multifile queue.
+
+    Shared by all four add methods (Add File button, file drag-drop, Add
+    Folder button, folder drag-drop) so they behave identically:
+    - Folders are walked recursively; their media files are imported like the
+      "Add Folder" button (files that already have a subtitle are skipped).
+    - Files supplied directly are added as-is (only exact duplicates skipped),
+      because the user explicitly chose them.
+
+    Returns (added, duplicates, skipped_existing, unsupported_paths).
+    """
+    candidates = []  # (media_path, came_from_folder)
+    unsupported = []
+    for p in paths:
+        if not p:
+            continue
+        if os.path.isdir(p):
+            for found in _collect_media_files_recursively(p):
+                candidates.append((found, True))
+        elif is_supported_media(p):
+            candidates.append((p, False))
+        else:
+            unsupported.append(p)
+
+    existing_paths = {os.path.normcase(os.path.abspath(p)) for p, _ in file_list}
+    added = duplicates = skipped_existing = 0
+    for media_path, from_folder in candidates:
+        norm = os.path.normcase(os.path.abspath(media_path))
+        if norm in existing_paths:
+            duplicates += 1
+            continue
+        if from_folder and _has_existing_subtitle(media_path):
+            skipped_existing += 1
+            continue
+        existing_paths.add(norm)
+        add_media_file_to_list(media_path)
+        added += 1
+
+    multifile_list_label['text'] = "0/" + str(len(file_list))
+    return added, duplicates, skipped_existing, unsupported
+
+
+def add_files_to_multifile():
+    """Add one or more media files to the multifile queue via a file picker."""
+    files = filedialog.askopenfilenames(
+        title=localization.getstr('add_file_dialog_title'),
+        initialdir=defaultdir,
+        filetypes=[
+            ("Supported media", " ".join(f"*{ext}" for ext in sorted(supported_media_extensions))),
+            ("All files", "*.*"),
+        ],
+    )
+    if not files:
+        return
+    # askopenfilenames may return a Tcl list string on some platforms.
+    files = list(window.tk.splitlist(files))
+    added, duplicates, skipped_existing, unsupported = _ingest_media_paths(files)
+    append_runtime_log(f"Add File: {added} added, {duplicates} duplicate(s) skipped")
+    if unsupported:
+        show_unsupported_media_message(unsupported)
+
+
 def add_folder_to_multifile():
     """Let the user pick a folder and bulk-add every supported media file inside it (recursive)."""
     folder = filedialog.askdirectory(
@@ -661,9 +718,7 @@ def add_folder_to_multifile():
     if not folder:
         return
 
-    found_files = _collect_media_files_recursively(folder)
-
-    if not found_files:
+    if not _collect_media_files_recursively(folder):
         messagebox.showinfo(
             localization.getstr('add_folder'),
             localization.getstr('add_folder_no_files').format(
@@ -672,23 +727,7 @@ def add_folder_to_multifile():
         )
         return
 
-    existing_paths = {os.path.normcase(os.path.abspath(p)) for p, _ in file_list}
-    added = 0
-    duplicates = 0
-    skipped_existing = 0
-    for file_path in found_files:
-        norm = os.path.normcase(os.path.abspath(file_path))
-        if norm in existing_paths:
-            duplicates += 1
-            continue
-        if _has_existing_subtitle(file_path):
-            skipped_existing += 1
-            continue
-        existing_paths.add(norm)
-        add_media_file_to_list(file_path)
-        added += 1
-
-    multifile_list_label['text'] = "0/" + str(len(file_list))
+    added, duplicates, skipped_existing, _unsupported = _ingest_media_paths([folder])
     append_runtime_log(
         f"Added {added} files from folder "
         f"(skipped: {duplicates} duplicate, {skipped_existing} already-subtitled): {folder}"
@@ -1673,12 +1712,19 @@ file_treeview_instruction = Label(
 )
 file_treeview_instruction.grid(column=0, row=0, sticky='w')
 
+add_file_button = Button(
+    multifile_header_frame,
+    text=localization.getstr('add_file'),
+    command=add_files_to_multifile,
+)
+add_file_button.grid(column=1, row=0, padx=(8, 4), sticky='e')
+
 add_folder_button = Button(
     multifile_header_frame,
     text=localization.getstr('add_folder'),
     command=add_folder_to_multifile,
 )
-add_folder_button.grid(column=1, row=0, padx=(8, 4), sticky='e')
+add_folder_button.grid(column=2, row=0, padx=(0, 4), sticky='e')
 
 file_treeview = ttk.Treeview(
     tree_frame,
