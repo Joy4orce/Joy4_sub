@@ -28,7 +28,7 @@ import sys
 import queue
 
 from extractaudio import get_media_length_in_time, get_supported_media_extensions, is_supported_media
-from utility import get_file_size_in_mb, treeview_sort_column, sort_by_path, shorten_path
+from utility import get_file_size_in_mb, treeview_sort_column, sort_by_path
 from settings import (
     load_settings, load_apikey, settingjson, save_apikey, get_settings_path,
     save_engine_apikey, load_engine_apikey, run_first_run_migrations,
@@ -509,13 +509,16 @@ def add_media_file_to_list(file_path):
         index=tkinter.END,
         iid=uuid.uuid4(),
         values=[
-            shorten_path(file_path),
+            file_path,
             str(get_file_size_in_mb(file_path)) + "MB",
             get_media_length_in_time(file_path),
             "Undone",
         ],
     )
-    file_list.append((file_path, shorten_path(file_path)))
+    # Second element is the treeview's displayed path value; it is compared
+    # against item_values[0] for delete/status lookups, so it MUST match what
+    # is shown. Now that we show the full path, store the full path here too.
+    file_list.append((file_path, file_path))
 
 def get_active_progress_queue():
     return multifile_queue if multi_processing else update_queue
@@ -1741,19 +1744,26 @@ file_treeview.heading(localization.getstr("length"), text=localization.getstr("l
 file_treeview.heading(localization.getstr("status"), text=localization.getstr("status"))
 
 file_treeview.column("#0", width=0, stretch=tkinter.NO)
-# Path column absorbs extra width when the window is wider than the default;
-# the small fixed-width columns (size / length / status) stay readable.
-file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=620, stretch=tkinter.YES)
+# Path column shows the FULL path (no abbreviation) and is wide by default;
+# it still absorbs extra width when the window is wider. Very long paths can
+# be read end-to-end by dragging the column wider and/or using the horizontal
+# scrollbar below. The small fixed-width columns stay readable.
+file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=900, minwidth=200, stretch=tkinter.YES)
 file_treeview.column(localization.getstr("size"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
 file_treeview.column(localization.getstr("length"), anchor=tkinter.W, width=100, stretch=tkinter.NO)
 file_treeview.column(localization.getstr("status"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
+
+# Horizontal scrollbar so full (long) file paths can be read end-to-end.
+file_treeview_xscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=file_treeview.xview)
+file_treeview.configure(xscrollcommand=file_treeview_xscroll.set)
+file_treeview_xscroll.grid(column=0, row=2, sticky='ew')
 
 
 
 # Bottom strip: progress bar, generate button, status indicators.
 # Sits below the treeview, full-width so the contents can be centered.
 generationframe = Frame(tree_frame)
-generationframe.grid(column=0, row=2, sticky='ew', pady=(8, 4))
+generationframe.grid(column=0, row=3, sticky='ew', pady=(8, 4))
 generationframe.grid_columnconfigure(0, weight=1)
 generationframe.grid_columnconfigure(2, weight=1)  # right side flex for visual balance
 
