@@ -1,6 +1,7 @@
 import locale
 import tkinter
 import tkinter.ttk
+import tkinter.font as tkfont
 import uuid
 from tkinter import *
 from tkinter import filedialog
@@ -503,6 +504,23 @@ def split_dnd_files(raw_data):
     return [path for path in window.tk.splitlist(raw_data) if path]
 
 
+def _autosize_path_column():
+    """Widen the path column to fit the longest queued path so the horizontal
+    scrollbar can pan across the entire path. Bounded so a pathological path
+    can't create an absurdly wide column. Safe to call anytime after the UI is
+    built; a no-op if the list is empty."""
+    try:
+        cell_font = tkfont.nametofont("TkDefaultFont")
+    except Exception:
+        return
+    longest = 0
+    for path, _spath in file_list:
+        longest = max(longest, cell_font.measure(path))
+    # +24px padding for cell margins; clamp to a sane range.
+    target = min(max(longest + 24, 300), 6000)
+    file_treeview.column(localization.getstr("path"), width=target)
+
+
 def add_media_file_to_list(file_path):
     file_treeview.insert(
         parent='',
@@ -556,6 +574,7 @@ def on_delete_key_press(event):
                 file_list.remove((path, spath))
         file_treeview.delete(item)
     multifile_list_label['text'] = "0/" + str(len(file_list))
+    _autosize_path_column()
 
 def check_multifile_status():
     # Build the spath -> path map once (O(N)) instead of scanning the
@@ -688,6 +707,7 @@ def _ingest_media_paths(paths):
         added += 1
 
     multifile_list_label['text'] = "0/" + str(len(file_list))
+    _autosize_path_column()
     return added, duplicates, skipped_existing, unsupported
 
 
@@ -1748,7 +1768,11 @@ file_treeview.column("#0", width=0, stretch=tkinter.NO)
 # it still absorbs extra width when the window is wider. Very long paths can
 # be read end-to-end by dragging the column wider and/or using the horizontal
 # scrollbar below. The small fixed-width columns stay readable.
-file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=900, minwidth=200, stretch=tkinter.YES)
+# Fixed width (stretch=NO) is REQUIRED for the horizontal scrollbar to work:
+# with stretch the column shrinks to fit the viewport, so content never
+# overflows and the scrollbar has no thumb. _autosize_path_column() grows this
+# to fit the longest queued path so the scrollbar can pan across the full path.
+file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=900, minwidth=200, stretch=tkinter.NO)
 file_treeview.column(localization.getstr("size"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
 file_treeview.column(localization.getstr("length"), anchor=tkinter.W, width=100, stretch=tkinter.NO)
 file_treeview.column(localization.getstr("status"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
