@@ -1024,7 +1024,13 @@ def proceed_multifile_whisperthread():
             file_name_without_extension, _ = os.path.splitext(file)
             file_audio = file_name_without_extension + "_joy4sub_temp.wav"
             append_runtime_log(f"Prepared temp audio path for multifile item {i + 1}/{len(file_list)}: {file_audio}")
-            if should_use_fast_whisper() and cuda_var.get():
+            # Qwen3-ASR is deliberately kept OUT of the subprocess-per-file path:
+            # a fresh worker per file would reload the ~3.5GB Qwen model every
+            # time (30-60s x N files). Routing it through the in-process path
+            # below lets qwenasr's module-level cache load the model ONCE and
+            # reuse it for the whole batch. Whisper keeps the subprocess path
+            # (cheap reload, memory isolation per file).
+            if should_use_fast_whisper() and cuda_var.get() and stt_engine_var.get() != "Qwen3-ASR":
                 append_runtime_log(f"Dispatching subprocess fast whisper for multifile item {i + 1}/{len(file_list)}")
                 multifile_queue.put(("text", f"Launching worker {i + 1}/{len(file_list)}"))
                 worker_script = os.path.join(os.path.dirname(__file__), "worker_subprocess.py")
@@ -1111,6 +1117,13 @@ def proceed_multifile_whisperthread():
                     append_runtime_log(f"Rate limit cancelled at multifile item {i + 1}/{len(file_list)}: {file}")
                     multifile_queue.put(("text", "작업 취소됨"))
                     break
+                except Exception as exc:
+                    # One unreadable/failed file must not abort the batch (matches
+                    # the subprocess path): mark Fail and move on to the next.
+                    multifile_failed_paths.add(file)
+                    append_runtime_log(f"In-process fast whisper failed for {file}: {type(exc).__name__}: {exc}; marking Fail and continuing")
+                    multifile_queue.put(("text", f"실패 (건너뜀): {os.path.basename(file)}"))
+                    continue
             else:
                 append_runtime_log(f"Dispatching stable whisper for multifile item {i + 1}/{len(file_list)}")
                 try:
@@ -1119,6 +1132,11 @@ def proceed_multifile_whisperthread():
                     append_runtime_log(f"Rate limit cancelled at multifile item {i + 1}/{len(file_list)}: {file}")
                     multifile_queue.put(("text", "작업 취소됨"))
                     break
+                except Exception as exc:
+                    multifile_failed_paths.add(file)
+                    append_runtime_log(f"In-process stable whisper failed for {file}: {type(exc).__name__}: {exc}; marking Fail and continuing")
+                    multifile_queue.put(("text", f"실패 (건너뜀): {os.path.basename(file)}"))
+                    continue
             append_runtime_log(f"Returned from worker for multifile item {i + 1}/{len(file_list)}: {file}")
             append_runtime_log(f"Finished multifile item {i + 1}/{len(file_list)}: {file}")
             # Rename media + all sibling subtitle/sidecar files to the
