@@ -1,6 +1,7 @@
 import locale
 import tkinter
 import tkinter.ttk
+import tkinter.font as tkfont
 import uuid
 from tkinter import *
 from tkinter import filedialog
@@ -28,7 +29,7 @@ import sys
 import queue
 
 from extractaudio import get_media_length_in_time, get_supported_media_extensions, is_supported_media
-from utility import get_file_size_in_mb, treeview_sort_column, sort_by_path, shorten_path
+from utility import get_file_size_in_mb, treeview_sort_column, sort_by_path
 from settings import (
     load_settings, load_apikey, settingjson, save_apikey, get_settings_path,
     save_engine_apikey, load_engine_apikey, run_first_run_migrations,
@@ -175,6 +176,8 @@ original_var = tkinter.BooleanVar()
 fast_var = tkinter.BooleanVar(value=True)
 
 translation_engine_var = tkinter.StringVar(value="DeepL")
+# Speech-to-text engine: "Whisper" (faster-whisper) or "Qwen3-ASR".
+stt_engine_var = tkinter.StringVar(value="Whisper")
 
 # Opt-in: when ON, rename every media file whose basename contains
 # Japanese characters to its translated form after that file's SRT
@@ -475,6 +478,10 @@ def _rename_pair_for_file(media_path, new_basename):
     )
     return new_media_path
 multifile_status_indicator = 0
+# Full paths of files whose worker failed during the current batch. Read by
+# check_multifile_status() (main thread) to mark those rows "Fail" instead of
+# leaving them stuck on "Undone". Cleared at the start of each batch run.
+multifile_failed_paths = set()
 supported_media_extensions = set(get_supported_media_extensions())
 
 
@@ -499,19 +506,39 @@ def split_dnd_files(raw_data):
     return [path for path in window.tk.splitlist(raw_data) if path]
 
 
+def _autosize_path_column():
+    """Widen the path column to fit the longest queued path so the horizontal
+    scrollbar can pan across the entire path. Bounded so a pathological path
+    can't create an absurdly wide column. Safe to call anytime after the UI is
+    built; a no-op if the list is empty."""
+    try:
+        cell_font = tkfont.nametofont("TkDefaultFont")
+    except Exception:
+        return
+    longest = 0
+    for path, _spath in file_list:
+        longest = max(longest, cell_font.measure(path))
+    # +24px padding for cell margins; clamp to a sane range.
+    target = min(max(longest + 24, 300), 6000)
+    file_treeview.column(localization.getstr("path"), width=target)
+
+
 def add_media_file_to_list(file_path):
     file_treeview.insert(
         parent='',
         index=tkinter.END,
         iid=uuid.uuid4(),
         values=[
-            shorten_path(file_path),
+            file_path,
             str(get_file_size_in_mb(file_path)) + "MB",
             get_media_length_in_time(file_path),
             "Undone",
         ],
     )
-    file_list.append((file_path, shorten_path(file_path)))
+    # Second element is the treeview's displayed path value; it is compared
+    # against item_values[0] for delete/status lookups, so it MUST match what
+    # is shown. Now that we show the full path, store the full path here too.
+    file_list.append((file_path, file_path))
 
 def get_active_progress_queue():
     return multifile_queue if multi_processing else update_queue
@@ -549,6 +576,7 @@ def on_delete_key_press(event):
                 file_list.remove((path, spath))
         file_treeview.delete(item)
     multifile_list_label['text'] = "0/" + str(len(file_list))
+    _autosize_path_column()
 
 def check_multifile_status():
     # Build the spath -> path map once (O(N)) instead of scanning the
@@ -563,7 +591,7 @@ def check_multifile_status():
 
     for item in file_treeview.get_children():
         item_value = list(file_treeview.item(item, 'values'))
-        if len(item_value) >= 4 and item_value[3] == "Done":
+        if len(item_value) >= 4 and item_value[3] in ("Done", "Fail"):
             continue
         path = path_by_spath.get(item_value[0])
         if path is None:
@@ -571,6 +599,12 @@ def check_multifile_status():
         base, _ = os.path.splitext(path)
         if os.path.exists(base + ".srt"):
             item_value[3] = "Done"
+            file_treeview.item(item, values=tuple(item_value))
+        elif path in multifile_failed_paths:
+            # Worker crashed on this file (e.g. unreadable/corrupt media).
+            # Surface it as Fail so the user can see WHICH files were skipped
+            # instead of them sitting on "Undone" forever.
+            item_value[3] = "Fail"
             file_treeview.item(item, values=tuple(item_value))
 
 def list_label_indicate( number = 0):
@@ -589,22 +623,16 @@ def on_filetap_drop(event):
 
 
 def on_drop(event):
-    dropped_files = split_dnd_files(event.data)
-    unsupported_files = [file for file in dropped_files if not is_supported_media(file)]
-    supported_files = [file for file in dropped_files if is_supported_media(file)]
-
-    if unsupported_files:
-        show_unsupported_media_message(unsupported_files)
-
-    existing_paths = {os.path.normcase(os.path.abspath(p)) for p, _ in file_list}
-    for file_path in supported_files:
-        norm = os.path.normcase(os.path.abspath(file_path))
-        if norm in existing_paths:
-            continue
-        existing_paths.add(norm)
-        add_media_file_to_list(file_path)
-
-    multifile_list_label['text'] = "0/" + str(len(file_list))
+    # Accepts BOTH files and folders. Dropped folders are expanded recursively
+    # (same as the "Add Folder" button), so all four add methods are supported.
+    dropped = split_dnd_files(event.data)
+    added, duplicates, skipped_existing, unsupported = _ingest_media_paths(dropped)
+    append_runtime_log(
+        f"Drag-drop: {added} added, {duplicates} duplicate(s), "
+        f"{skipped_existing} already-subtitled skipped"
+    )
+    if unsupported:
+        show_unsupported_media_message(unsupported)
 
 
 def _collect_media_files_recursively(folder_path):
@@ -641,6 +669,70 @@ def _has_existing_subtitle(media_path):
     return any(os.path.exists(c) for c in candidates)
 
 
+def _ingest_media_paths(paths):
+    """Add a mix of files and folders to the multifile queue.
+
+    Shared by all four add methods (Add File button, file drag-drop, Add
+    Folder button, folder drag-drop) so they behave identically:
+    - Folders are walked recursively; their media files are imported like the
+      "Add Folder" button (files that already have a subtitle are skipped).
+    - Files supplied directly are added as-is (only exact duplicates skipped),
+      because the user explicitly chose them.
+
+    Returns (added, duplicates, skipped_existing, unsupported_paths).
+    """
+    candidates = []  # (media_path, came_from_folder)
+    unsupported = []
+    for p in paths:
+        if not p:
+            continue
+        if os.path.isdir(p):
+            for found in _collect_media_files_recursively(p):
+                candidates.append((found, True))
+        elif is_supported_media(p):
+            candidates.append((p, False))
+        else:
+            unsupported.append(p)
+
+    existing_paths = {os.path.normcase(os.path.abspath(p)) for p, _ in file_list}
+    added = duplicates = skipped_existing = 0
+    for media_path, from_folder in candidates:
+        norm = os.path.normcase(os.path.abspath(media_path))
+        if norm in existing_paths:
+            duplicates += 1
+            continue
+        if from_folder and _has_existing_subtitle(media_path):
+            skipped_existing += 1
+            continue
+        existing_paths.add(norm)
+        add_media_file_to_list(media_path)
+        added += 1
+
+    multifile_list_label['text'] = "0/" + str(len(file_list))
+    _autosize_path_column()
+    return added, duplicates, skipped_existing, unsupported
+
+
+def add_files_to_multifile():
+    """Add one or more media files to the multifile queue via a file picker."""
+    files = filedialog.askopenfilenames(
+        title=localization.getstr('add_file_dialog_title'),
+        initialdir=defaultdir,
+        filetypes=[
+            ("Supported media", " ".join(f"*{ext}" for ext in sorted(supported_media_extensions))),
+            ("All files", "*.*"),
+        ],
+    )
+    if not files:
+        return
+    # askopenfilenames may return a Tcl list string on some platforms.
+    files = list(window.tk.splitlist(files))
+    added, duplicates, skipped_existing, unsupported = _ingest_media_paths(files)
+    append_runtime_log(f"Add File: {added} added, {duplicates} duplicate(s) skipped")
+    if unsupported:
+        show_unsupported_media_message(unsupported)
+
+
 def add_folder_to_multifile():
     """Let the user pick a folder and bulk-add every supported media file inside it (recursive)."""
     folder = filedialog.askdirectory(
@@ -651,9 +743,7 @@ def add_folder_to_multifile():
     if not folder:
         return
 
-    found_files = _collect_media_files_recursively(folder)
-
-    if not found_files:
+    if not _collect_media_files_recursively(folder):
         messagebox.showinfo(
             localization.getstr('add_folder'),
             localization.getstr('add_folder_no_files').format(
@@ -662,23 +752,7 @@ def add_folder_to_multifile():
         )
         return
 
-    existing_paths = {os.path.normcase(os.path.abspath(p)) for p, _ in file_list}
-    added = 0
-    duplicates = 0
-    skipped_existing = 0
-    for file_path in found_files:
-        norm = os.path.normcase(os.path.abspath(file_path))
-        if norm in existing_paths:
-            duplicates += 1
-            continue
-        if _has_existing_subtitle(file_path):
-            skipped_existing += 1
-            continue
-        existing_paths.add(norm)
-        add_media_file_to_list(file_path)
-        added += 1
-
-    multifile_list_label['text'] = "0/" + str(len(file_list))
+    added, duplicates, skipped_existing, _unsupported = _ingest_media_paths([folder])
     append_runtime_log(
         f"Added {added} files from folder "
         f"(skipped: {duplicates} duplicate, {skipped_existing} already-subtitled): {folder}"
@@ -743,6 +817,7 @@ def proceedfastwhisperthread():
         local_apikey=get_local_apikey_input(),
         cancel_event=_cancel_event,
         translate_filenames=translate_filenames_var.get(),
+        stt_engine=stt_engine_var.get(),
     )
     save_all_apikeys()
     settingjson(transferuiwrapper)
@@ -908,9 +983,14 @@ def proceed_multifile_whisperthread():
             local_system_prompt=get_local_system_prompt_input(),
             local_temperature=get_local_temperature_input(),
             local_apikey=get_local_apikey_input(),
+            stt_engine=stt_engine_var.get(),
         )
         save_all_apikeys()
         settingjson(transferuiwrapper)
+
+        # Fresh batch → clear last run's failures so stale "Fail" rows don't
+        # carry over into this run's status display.
+        multifile_failed_paths.clear()
 
         # If filename translation is enabled, batch-translate all Japanese
         # basenames up front in ONE engine call. 267 files of Claude
@@ -944,7 +1024,13 @@ def proceed_multifile_whisperthread():
             file_name_without_extension, _ = os.path.splitext(file)
             file_audio = file_name_without_extension + "_joy4sub_temp.wav"
             append_runtime_log(f"Prepared temp audio path for multifile item {i + 1}/{len(file_list)}: {file_audio}")
-            if should_use_fast_whisper() and cuda_var.get():
+            # Qwen3-ASR is deliberately kept OUT of the subprocess-per-file path:
+            # a fresh worker per file would reload the ~3.5GB Qwen model every
+            # time (30-60s x N files). Routing it through the in-process path
+            # below lets qwenasr's module-level cache load the model ONCE and
+            # reuse it for the whole batch. Whisper keeps the subprocess path
+            # (cheap reload, memory isolation per file).
+            if should_use_fast_whisper() and cuda_var.get() and stt_engine_var.get() != "Qwen3-ASR":
                 append_runtime_log(f"Dispatching subprocess fast whisper for multifile item {i + 1}/{len(file_list)}")
                 multifile_queue.put(("text", f"Launching worker {i + 1}/{len(file_list)}"))
                 worker_script = os.path.join(os.path.dirname(__file__), "worker_subprocess.py")
@@ -978,6 +1064,7 @@ def proceed_multifile_whisperthread():
                 if cuda_var.get():
                     worker_args.append("--cuda")
                 worker_args.extend(["--engine", translation_engine_var.get()])
+                worker_args.extend(["--stt-engine", stt_engine_var.get()])
 
                 rate_limit_cancelled = False
                 while True:
@@ -1010,7 +1097,13 @@ def proceed_multifile_whisperthread():
                             rate_limit_cancelled = True
                             break
                     elif returncode != 0:
-                        multifile_queue.put(("text", f"Worker failed: {os.path.basename(file)}"))
+                        # A single unreadable/corrupt file (e.g. non-RIFF .wav,
+                        # an mp3 ffmpeg can't parse) must NOT abort the whole
+                        # batch. Record it as failed, tell the user, and move on
+                        # to the next file so the remaining ones still process.
+                        multifile_failed_paths.add(file)
+                        append_runtime_log(f"Worker failed for {file}; marking Fail and continuing")
+                        multifile_queue.put(("text", f"Worker failed (skipping): {os.path.basename(file)}"))
                         break
                     else:
                         break
@@ -1024,6 +1117,13 @@ def proceed_multifile_whisperthread():
                     append_runtime_log(f"Rate limit cancelled at multifile item {i + 1}/{len(file_list)}: {file}")
                     multifile_queue.put(("text", "작업 취소됨"))
                     break
+                except Exception as exc:
+                    # One unreadable/failed file must not abort the batch (matches
+                    # the subprocess path): mark Fail and move on to the next.
+                    multifile_failed_paths.add(file)
+                    append_runtime_log(f"In-process fast whisper failed for {file}: {type(exc).__name__}: {exc}; marking Fail and continuing")
+                    multifile_queue.put(("text", f"실패 (건너뜀): {os.path.basename(file)}"))
+                    continue
             else:
                 append_runtime_log(f"Dispatching stable whisper for multifile item {i + 1}/{len(file_list)}")
                 try:
@@ -1032,6 +1132,11 @@ def proceed_multifile_whisperthread():
                     append_runtime_log(f"Rate limit cancelled at multifile item {i + 1}/{len(file_list)}: {file}")
                     multifile_queue.put(("text", "작업 취소됨"))
                     break
+                except Exception as exc:
+                    multifile_failed_paths.add(file)
+                    append_runtime_log(f"In-process stable whisper failed for {file}: {type(exc).__name__}: {exc}; marking Fail and continuing")
+                    multifile_queue.put(("text", f"실패 (건너뜀): {os.path.basename(file)}"))
+                    continue
             append_runtime_log(f"Returned from worker for multifile item {i + 1}/{len(file_list)}: {file}")
             append_runtime_log(f"Finished multifile item {i + 1}/{len(file_list)}: {file}")
             # Rename media + all sibling subtitle/sidecar files to the
@@ -1239,6 +1344,7 @@ def initialize():
     original_var.set(settings.get("original", False))
     fast_var.set(settings.get("fast", True) or saved_model in {"large-v3", "large-v3-turbo"})
     translation_engine_var.set(settings.get("translation_engine", "DeepL"))
+    stt_engine_var.set(settings.get("stt_engine", "Whisper"))
     saved_gemini_model = settings.get("gemini_model", "")
     if saved_gemini_model:
         gemini_model_var.set(saved_gemini_model)
@@ -1403,6 +1509,13 @@ modeldropdown = ttk.Combobox(frame2, textvariable=translateoption_var, values=tr
 modeldropdown.grid(column=0, row=0)
 checkbox = ttk.Checkbutton(frame2, text="Cuda", variable=cuda_var)
 checkbox.grid(column=1, row=0, padx=(10, 0))
+
+# Speech-to-text engine selector: Whisper (default) or Qwen3-ASR.
+Label(frame2, text=localization.getstr('stt_engine')).grid(column=0, row=1, sticky='w', pady=(6, 0))
+Radiobutton(frame2, text="Whisper", variable=stt_engine_var, value="Whisper"
+            ).grid(column=1, row=1, sticky='w', pady=(6, 0))
+Radiobutton(frame2, text="Qwen3-ASR", variable=stt_engine_var, value="Qwen3-ASR"
+            ).grid(column=2, row=1, sticky='w', pady=(6, 0))
 
 # Row 2 — source language code
 Label(form_frame, text=localization.getstr('sourcelangcode'), justify='left'
@@ -1653,12 +1766,19 @@ file_treeview_instruction = Label(
 )
 file_treeview_instruction.grid(column=0, row=0, sticky='w')
 
+add_file_button = Button(
+    multifile_header_frame,
+    text=localization.getstr('add_file'),
+    command=add_files_to_multifile,
+)
+add_file_button.grid(column=1, row=0, padx=(8, 4), sticky='e')
+
 add_folder_button = Button(
     multifile_header_frame,
     text=localization.getstr('add_folder'),
     command=add_folder_to_multifile,
 )
-add_folder_button.grid(column=1, row=0, padx=(8, 4), sticky='e')
+add_folder_button.grid(column=2, row=0, padx=(0, 4), sticky='e')
 
 file_treeview = ttk.Treeview(
     tree_frame,
@@ -1675,19 +1795,30 @@ file_treeview.heading(localization.getstr("length"), text=localization.getstr("l
 file_treeview.heading(localization.getstr("status"), text=localization.getstr("status"))
 
 file_treeview.column("#0", width=0, stretch=tkinter.NO)
-# Path column absorbs extra width when the window is wider than the default;
-# the small fixed-width columns (size / length / status) stay readable.
-file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=620, stretch=tkinter.YES)
+# Path column shows the FULL path (no abbreviation) and is wide by default;
+# it still absorbs extra width when the window is wider. Very long paths can
+# be read end-to-end by dragging the column wider and/or using the horizontal
+# scrollbar below. The small fixed-width columns stay readable.
+# Fixed width (stretch=NO) is REQUIRED for the horizontal scrollbar to work:
+# with stretch the column shrinks to fit the viewport, so content never
+# overflows and the scrollbar has no thumb. _autosize_path_column() grows this
+# to fit the longest queued path so the scrollbar can pan across the full path.
+file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=900, minwidth=200, stretch=tkinter.NO)
 file_treeview.column(localization.getstr("size"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
 file_treeview.column(localization.getstr("length"), anchor=tkinter.W, width=100, stretch=tkinter.NO)
 file_treeview.column(localization.getstr("status"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
+
+# Horizontal scrollbar so full (long) file paths can be read end-to-end.
+file_treeview_xscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=file_treeview.xview)
+file_treeview.configure(xscrollcommand=file_treeview_xscroll.set)
+file_treeview_xscroll.grid(column=0, row=2, sticky='ew')
 
 
 
 # Bottom strip: progress bar, generate button, status indicators.
 # Sits below the treeview, full-width so the contents can be centered.
 generationframe = Frame(tree_frame)
-generationframe.grid(column=0, row=2, sticky='ew', pady=(8, 4))
+generationframe.grid(column=0, row=3, sticky='ew', pady=(8, 4))
 generationframe.grid_columnconfigure(0, weight=1)
 generationframe.grid_columnconfigure(2, weight=1)  # right side flex for visual balance
 

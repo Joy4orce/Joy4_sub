@@ -22,7 +22,7 @@ ENGINE_NAME = "Local LLM"
 DEFAULT_ENDPOINT = "http://localhost:5001/v1"
 DEFAULT_MODEL = "local"
 DEFAULT_SYSTEM_PROMPT = (
-    "당신은 전문 일한 번역가입니다. 주어진 일본어를 한국어로 번역하세요."
+    "당신은 전문 자막 번역가입니다. 주어진 자막(일본어 또는 중국어)을 한국어로 자연스럽게 번역하세요."
 )
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_API_KEY = "sk-local"
@@ -184,7 +184,8 @@ def _per_line_fallback(client, model_name, system_prompt_prefix, target_lang,
 
     out = []
     single_suffix = (
-        f" Translate to {target_lang}. "
+        f" The source may be Japanese or Chinese; translate it into {target_lang} "
+        "regardless of its original language. "
         "Reply with ONLY the translated sentence, nothing else. "
         "No explanations. No quotes. No formatting."
     )
@@ -446,7 +447,8 @@ def translateusinglocal(text, uiwrapper):
         # Stricter than openaiwrapper because local multilingual models (Gemma etc.)
         # often wrap output in markdown or add prose unless explicitly forbidden.
         suffix = (
-            f" Translate to {target_lang}. "
+            f" The source lines may be in Japanese, Chinese, or a mix of both; "
+            f"translate every line into {target_lang} regardless of its original language. "
             f"Input has {len(lines)} lines, output must have exactly {len(lines)} lines. "
             "Return ONLY a JSON array of translated strings with the exact same length. "
             "Do not merge, split, add, or remove entries. "

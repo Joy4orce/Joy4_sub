@@ -6,7 +6,7 @@ from datetime import datetime
 import stable_whisper
 import torch
 import whisper
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 from whisper.utils import get_writer
 
 from claudewrapper import ClaudeRateLimitError, ClaudeSafetyRefusalError, translateusingclaude
@@ -40,6 +40,28 @@ def append_runtime_log(message):
     with open(runtime_log_path, "a", encoding="utf-8") as log_file:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_file.write(f"[{timestamp}] {message}\n")
+
+
+def _safe_media_seconds(file):
+    """Media duration in seconds, for progress-bar scaling ONLY. Never raises.
+
+    Some real files fail duration probing yet still transcribe fine via
+    faster-whisper's own decoder: non-RIFF .wav files (Python's wave module
+    rejects them) and mp3s whose ffmpeg stderr moviepy can't parse. Previously
+    the raised exception here crashed the whole worker before any subtitle was
+    written, which — combined with the multifile loop aborting on the first
+    worker failure — made an entire batch "complete nothing". Returns 0.0 on
+    failure; callers MUST treat 0 as "unknown" and never divide by it.
+    """
+    try:
+        seconds = get_media_length_in_seconds(file)
+        return seconds if seconds and seconds > 0 else 0.0
+    except Exception as exc:
+        append_runtime_log(
+            f"Media length probe failed for {file}: {type(exc).__name__}: {exc}; "
+            f"progress bar will be approximate"
+        )
+        return 0.0
 
 
 def clear_gpu_memory():
@@ -254,32 +276,111 @@ def translate_srt_file(transcribed_srt_path, translated_srt_path, uiwrapper):
     return True
 
 
+# --- Batched transcription (faster-whisper BatchedInferencePipeline) ---
+# ~4x faster than sequential decoding on GPU with the same accuracy. It chunks
+# audio with Silero VAD, so a too-aggressive VAD could drop very quiet speech —
+# a real risk for whispered ASMR. We therefore use a SENSITIVE VAD (low
+# threshold + generous padding) so soft passages survive. Flip
+# USE_BATCHED_TRANSCRIPTION to False to fall back to plain sequential decoding.
+USE_BATCHED_TRANSCRIPTION = True
+BATCH_SIZE = 16  # RTX 5080 (16GB) handles this easily at large-v3-turbo / fp16
+# Low threshold catches whispers; keep short silences + padding so soft speech
+# isn't merged away. Lower `threshold` further (e.g. 0.1) if quiet lines vanish.
+_ASMR_VAD_PARAMETERS = dict(threshold=0.2, min_silence_duration_ms=500, speech_pad_ms=400)
+
+
+def _fw_transcribe(model, file, uiwrapper, use_gpu):
+    """Return a faster-whisper segments iterator, using the batched pipeline on
+    GPU for a large speedup and falling back to sequential decoding otherwise.
+
+    word_timestamps stays on so SRT alignment is identical to before. The
+    batched pipeline decodes each VAD chunk independently, so
+    condition_on_previous_text does not apply there (and is only passed to the
+    sequential path)."""
+    src_lang = uiwrapper.get_srclanguagecodeinput() or None
+
+    if USE_BATCHED_TRANSCRIPTION and use_gpu:
+        try:
+            pipeline = BatchedInferencePipeline(model=model)
+            segments, _info = pipeline.transcribe(
+                file,
+                batch_size=BATCH_SIZE,
+                beam_size=5,
+                word_timestamps=True,
+                language=src_lang,
+                vad_parameters=_ASMR_VAD_PARAMETERS,
+            )
+            append_runtime_log(
+                f"Transcribing with BatchedInferencePipeline (batch_size={BATCH_SIZE}, "
+                f"vad_threshold={_ASMR_VAD_PARAMETERS['threshold']})"
+            )
+            return segments
+        except Exception as exc:
+            append_runtime_log(
+                f"Batched pipeline unavailable ({type(exc).__name__}: {exc}); "
+                f"falling back to sequential decoding"
+            )
+
+    segments, _info = model.transcribe(
+        file,
+        beam_size=5,
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        **({"language": src_lang} if src_lang else {}),
+    )
+    return segments
+
+
+def _stt_engine(uiwrapper):
+    """Which speech-to-text engine to use: 'Whisper' (default) or 'Qwen3-ASR'."""
+    getter = getattr(uiwrapper, "get_stt_engine", None)
+    if getter is None:
+        return "Whisper"
+    try:
+        return (getter() or "Whisper")
+    except Exception:
+        return "Whisper"
+
+
+class _QwenSeg:
+    """Adapts a Qwen3-ASR (start, end, text) tuple to the same shape as a
+    faster-whisper segment so the existing SRT-writing loops work unchanged.
+    no_speech_prob is 0.0 (Qwen only returns real speech windows via VAD)."""
+    __slots__ = ("start", "end", "text", "no_speech_prob")
+
+    def __init__(self, start, end, text):
+        self.start = start
+        self.end = end
+        self.text = text
+        self.no_speech_prob = 0.0
+
+
+def _qwen_segments(file, uiwrapper):
+    """Transcribe with Qwen3-ASR, returning whisper-segment-shaped objects."""
+    from qwenasr import transcribe_qwen
+    append_runtime_log(f"Transcribing with Qwen3-ASR: {file}")
+    return [_QwenSeg(s, e, t) for s, e, t in transcribe_qwen(file, uiwrapper)]
+
+
 def transcribe_fast_whisper(file, option, uiwrapper, output_base=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     append_runtime_log(f"Fast whisper started for {file} on {device.type}")
 
     model = None
     try:
-        if uiwrapper.get_cuda_var() and device.type == "cuda":
-            model = WhisperModel(option, device="cuda", compute_type="float16")
-        else:
-            model = WhisperModel(option, device="cpu", compute_type="int8")
-
         srtfile = (output_base or os.path.splitext(file)[0]) + ".srt"
-        if uiwrapper.get_srclanguagecodeinput() == "":
-            segments, _ = model.transcribe(file, beam_size=5, word_timestamps=True,
-                                           condition_on_previous_text=False)
+        if _stt_engine(uiwrapper) == "Qwen3-ASR":
+            segments = _qwen_segments(file, uiwrapper)
         else:
-            segments, _ = model.transcribe(
-                file,
-                beam_size=5,
-                word_timestamps=True,
-                language=uiwrapper.get_srclanguagecodeinput(),
-                condition_on_previous_text=False,
-            )
+            use_gpu = uiwrapper.get_cuda_var() and device.type == "cuda"
+            if use_gpu:
+                model = WhisperModel(option, device="cuda", compute_type="float16")
+            else:
+                model = WhisperModel(option, device="cpu", compute_type="int8")
+            segments = _fw_transcribe(model, file, uiwrapper, use_gpu)
 
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
+        allseconds = _safe_media_seconds(file)
+        uiwrapper.update_progressbar("maximum", allseconds or 1)
 
         if os.path.exists(srtfile):
             os.remove(srtfile)
@@ -295,7 +396,7 @@ def transcribe_fast_whisper(file, option, uiwrapper, output_base=None):
                             f"{index}\n{format_seconds(segment.start)} --> {format_seconds(segment.end)}\n{translated_string}\n\n"
                         )
                     uiwrapper.update_progressbar("value", segment.end)
-                    uiwrapper.update_percentagelabel_post("text", "{:.2f}%".format((segment.end / allseconds) * 100))
+                    uiwrapper.update_percentagelabel_post("text", "{:.2f}%".format((segment.end / allseconds) * 100) if allseconds else "Transcribing...")
         except ClaudeRateLimitError:
             if os.path.exists(srtfile):
                 os.remove(srtfile)
@@ -322,29 +423,22 @@ def transcribe_fast_whisper_differently(file, option, uiwrapper, output_base=Non
 
     model = None
     try:
-        if uiwrapper.get_cuda_var() and device.type == "cuda":
-            model = WhisperModel(option, device="cuda", compute_type="float16")
-        else:
-            model = WhisperModel(option, device="cpu", compute_type="int8")
-
         final_base = output_base or os.path.splitext(file)[0]
         translatedsrtfile = final_base + ".srt"
         transcribedsrtfile = final_base + "_original.srt"
 
-        if uiwrapper.get_srclanguagecodeinput() == "":
-            segments, _ = model.transcribe(file, beam_size=5, word_timestamps=True,
-                                           condition_on_previous_text=False)
+        if _stt_engine(uiwrapper) == "Qwen3-ASR":
+            segments = _qwen_segments(file, uiwrapper)
         else:
-            segments, _ = model.transcribe(
-                file,
-                beam_size=5,
-                word_timestamps=True,
-                language=uiwrapper.get_srclanguagecodeinput(),
-                condition_on_previous_text=False,
-            )
+            use_gpu = uiwrapper.get_cuda_var() and device.type == "cuda"
+            if use_gpu:
+                model = WhisperModel(option, device="cuda", compute_type="float16")
+            else:
+                model = WhisperModel(option, device="cpu", compute_type="int8")
+            segments = _fw_transcribe(model, file, uiwrapper, use_gpu)
 
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
+        allseconds = _safe_media_seconds(file)
+        uiwrapper.update_progressbar("maximum", allseconds or 1)
 
         with open(transcribedsrtfile, "w", encoding="utf8") as srt_output:
             for index, segment in enumerate(segments, start=1):
@@ -354,7 +448,7 @@ def transcribe_fast_whisper_differently(file, option, uiwrapper, output_base=Non
                     f"{index}\n{format_seconds(segment.start)} --> {format_seconds(segment.end)}\n{segment.text.strip()}\n\n"
                 )
                 uiwrapper.update_progressbar("value", segment.end)
-                uiwrapper.update_percentagelabel_post("text", "{:.2f}%".format((segment.end / allseconds) * 100))
+                uiwrapper.update_percentagelabel_post("text", "{:.2f}%".format((segment.end / allseconds) * 100) if allseconds else "Transcribing...")
 
         append_runtime_log(f"Finished transcription stage for {file}")
         uiwrapper.update_percentagelabel_post("text", "Transcription done, starting translation...")
@@ -411,8 +505,8 @@ def transcribe_whisper(file, option, uiwrapper, output_base=None):
         writer = get_writer("srt", os.path.dirname(transcribedsrtfile) or ".")
         writer(result, transcribedsrtfile)
 
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
+        allseconds = _safe_media_seconds(file)
+        uiwrapper.update_progressbar("maximum", allseconds or 1)
 
         append_runtime_log(f"Finished whisper transcription stage for {file}")
         uiwrapper.update_percentagelabel_post("text", "Transcription done, starting translation...")
@@ -476,8 +570,8 @@ def transcribe_stable_whisper(file, option, uiwrapper, output_base=None):
             )
         result.to_srt_vtt(transcribedsrtfile, word_level=False)
 
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
+        allseconds = _safe_media_seconds(file)
+        uiwrapper.update_progressbar("maximum", allseconds or 1)
 
         append_runtime_log(f"Finished stable whisper transcription stage for {file}")
         uiwrapper.update_percentagelabel_post("text", "Transcription done, starting translation...")
