@@ -59,7 +59,7 @@ class WorkerUIWrapper:
                  gemini_model="", openai_model="",
                  claude_pro_token="", claude_team_token="", claude_default_plan="pro",
                  local_endpoint="", local_model="", local_system_prompt="",
-                 local_temperature=0.1, local_apikey=""):
+                 local_temperature=0.1, local_apikey="", stt_engine="Whisper"):
         self.api_key = api_key  # legacy
         self.cuda_enabled = cuda_enabled
         self.model_name = model_name
@@ -81,6 +81,10 @@ class WorkerUIWrapper:
         self.local_system_prompt = local_system_prompt
         self.local_temperature = local_temperature
         self.local_apikey = local_apikey
+        self.stt_engine = stt_engine
+
+    def get_stt_engine(self):
+        return self.stt_engine
 
     def update_percentagelabel_post(self, text, value):
         # Forward to parent UI through the stdout sentinel channel (when
@@ -194,6 +198,7 @@ def parse_args():
     parser.add_argument("--local-system-prompt", default="")
     parser.add_argument("--local-temperature", default="0.1")
     parser.add_argument("--local-apikey", default="")
+    parser.add_argument("--stt-engine", default="Whisper")
     return parser.parse_args()
 
 
@@ -227,6 +232,7 @@ def main():
         local_system_prompt=args.local_system_prompt,
         local_temperature=local_temp,
         local_apikey=args.local_apikey,
+        stt_engine=args.stt_engine,
     )
 
     try:

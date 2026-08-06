@@ -176,6 +176,8 @@ original_var = tkinter.BooleanVar()
 fast_var = tkinter.BooleanVar(value=True)
 
 translation_engine_var = tkinter.StringVar(value="DeepL")
+# Speech-to-text engine: "Whisper" (faster-whisper) or "Qwen3-ASR".
+stt_engine_var = tkinter.StringVar(value="Whisper")
 
 # Opt-in: when ON, rename every media file whose basename contains
 # Japanese characters to its translated form after that file's SRT
@@ -815,6 +817,7 @@ def proceedfastwhisperthread():
         local_apikey=get_local_apikey_input(),
         cancel_event=_cancel_event,
         translate_filenames=translate_filenames_var.get(),
+        stt_engine=stt_engine_var.get(),
     )
     save_all_apikeys()
     settingjson(transferuiwrapper)
@@ -980,6 +983,7 @@ def proceed_multifile_whisperthread():
             local_system_prompt=get_local_system_prompt_input(),
             local_temperature=get_local_temperature_input(),
             local_apikey=get_local_apikey_input(),
+            stt_engine=stt_engine_var.get(),
         )
         save_all_apikeys()
         settingjson(transferuiwrapper)
@@ -1054,6 +1058,7 @@ def proceed_multifile_whisperthread():
                 if cuda_var.get():
                     worker_args.append("--cuda")
                 worker_args.extend(["--engine", translation_engine_var.get()])
+                worker_args.extend(["--stt-engine", stt_engine_var.get()])
 
                 rate_limit_cancelled = False
                 while True:
@@ -1321,6 +1326,7 @@ def initialize():
     original_var.set(settings.get("original", False))
     fast_var.set(settings.get("fast", True) or saved_model in {"large-v3", "large-v3-turbo"})
     translation_engine_var.set(settings.get("translation_engine", "DeepL"))
+    stt_engine_var.set(settings.get("stt_engine", "Whisper"))
     saved_gemini_model = settings.get("gemini_model", "")
     if saved_gemini_model:
         gemini_model_var.set(saved_gemini_model)
@@ -1485,6 +1491,13 @@ modeldropdown = ttk.Combobox(frame2, textvariable=translateoption_var, values=tr
 modeldropdown.grid(column=0, row=0)
 checkbox = ttk.Checkbutton(frame2, text="Cuda", variable=cuda_var)
 checkbox.grid(column=1, row=0, padx=(10, 0))
+
+# Speech-to-text engine selector: Whisper (default) or Qwen3-ASR.
+Label(frame2, text=localization.getstr('stt_engine')).grid(column=0, row=1, sticky='w', pady=(6, 0))
+Radiobutton(frame2, text="Whisper", variable=stt_engine_var, value="Whisper"
+            ).grid(column=1, row=1, sticky='w', pady=(6, 0))
+Radiobutton(frame2, text="Qwen3-ASR", variable=stt_engine_var, value="Qwen3-ASR"
+            ).grid(column=2, row=1, sticky='w', pady=(6, 0))
 
 # Row 2 — source language code
 Label(form_frame, text=localization.getstr('sourcelangcode'), justify='left'

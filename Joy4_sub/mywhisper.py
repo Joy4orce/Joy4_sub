@@ -331,20 +331,53 @@ def _fw_transcribe(model, file, uiwrapper, use_gpu):
     return segments
 
 
+def _stt_engine(uiwrapper):
+    """Which speech-to-text engine to use: 'Whisper' (default) or 'Qwen3-ASR'."""
+    getter = getattr(uiwrapper, "get_stt_engine", None)
+    if getter is None:
+        return "Whisper"
+    try:
+        return (getter() or "Whisper")
+    except Exception:
+        return "Whisper"
+
+
+class _QwenSeg:
+    """Adapts a Qwen3-ASR (start, end, text) tuple to the same shape as a
+    faster-whisper segment so the existing SRT-writing loops work unchanged.
+    no_speech_prob is 0.0 (Qwen only returns real speech windows via VAD)."""
+    __slots__ = ("start", "end", "text", "no_speech_prob")
+
+    def __init__(self, start, end, text):
+        self.start = start
+        self.end = end
+        self.text = text
+        self.no_speech_prob = 0.0
+
+
+def _qwen_segments(file, uiwrapper):
+    """Transcribe with Qwen3-ASR, returning whisper-segment-shaped objects."""
+    from qwenasr import transcribe_qwen
+    append_runtime_log(f"Transcribing with Qwen3-ASR: {file}")
+    return [_QwenSeg(s, e, t) for s, e, t in transcribe_qwen(file, uiwrapper)]
+
+
 def transcribe_fast_whisper(file, option, uiwrapper, output_base=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     append_runtime_log(f"Fast whisper started for {file} on {device.type}")
 
     model = None
     try:
-        use_gpu = uiwrapper.get_cuda_var() and device.type == "cuda"
-        if use_gpu:
-            model = WhisperModel(option, device="cuda", compute_type="float16")
-        else:
-            model = WhisperModel(option, device="cpu", compute_type="int8")
-
         srtfile = (output_base or os.path.splitext(file)[0]) + ".srt"
-        segments = _fw_transcribe(model, file, uiwrapper, use_gpu)
+        if _stt_engine(uiwrapper) == "Qwen3-ASR":
+            segments = _qwen_segments(file, uiwrapper)
+        else:
+            use_gpu = uiwrapper.get_cuda_var() and device.type == "cuda"
+            if use_gpu:
+                model = WhisperModel(option, device="cuda", compute_type="float16")
+            else:
+                model = WhisperModel(option, device="cpu", compute_type="int8")
+            segments = _fw_transcribe(model, file, uiwrapper, use_gpu)
 
         allseconds = _safe_media_seconds(file)
         uiwrapper.update_progressbar("maximum", allseconds or 1)
@@ -390,17 +423,19 @@ def transcribe_fast_whisper_differently(file, option, uiwrapper, output_base=Non
 
     model = None
     try:
-        use_gpu = uiwrapper.get_cuda_var() and device.type == "cuda"
-        if use_gpu:
-            model = WhisperModel(option, device="cuda", compute_type="float16")
-        else:
-            model = WhisperModel(option, device="cpu", compute_type="int8")
-
         final_base = output_base or os.path.splitext(file)[0]
         translatedsrtfile = final_base + ".srt"
         transcribedsrtfile = final_base + "_original.srt"
 
-        segments = _fw_transcribe(model, file, uiwrapper, use_gpu)
+        if _stt_engine(uiwrapper) == "Qwen3-ASR":
+            segments = _qwen_segments(file, uiwrapper)
+        else:
+            use_gpu = uiwrapper.get_cuda_var() and device.type == "cuda"
+            if use_gpu:
+                model = WhisperModel(option, device="cuda", compute_type="float16")
+            else:
+                model = WhisperModel(option, device="cpu", compute_type="int8")
+            segments = _fw_transcribe(model, file, uiwrapper, use_gpu)
 
         allseconds = _safe_media_seconds(file)
         uiwrapper.update_progressbar("maximum", allseconds or 1)

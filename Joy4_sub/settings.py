@@ -212,6 +212,7 @@ def settingjson(uiwrapper):
         "local_model": getattr(uiwrapper, 'local_model', '') or '',
         "local_system_prompt": getattr(uiwrapper, 'local_system_prompt', '') or '',
         "local_temperature": getattr(uiwrapper, 'local_temperature', 0.1),
+        "stt_engine": getattr(uiwrapper, 'stt_engine', 'Whisper') or 'Whisper',
     }
     with open(get_settings_path(), "w", encoding="utf-8") as f:
         json.dump(settings, f)
