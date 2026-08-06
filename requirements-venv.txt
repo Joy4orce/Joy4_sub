@@ -1,11 +1,14 @@
 # Joy4_sub - direct runtime dependencies
 # Used by Joy4_sub-Setup.bat to provision a working .venv-vatsg
-# Install with: pip install --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements-venv.txt
+# Install with: pip install --extra-index-url https://download.pytorch.org/whl/cu128 -r requirements-venv.txt
+# CUDA 12.8 builds are required for NVIDIA Blackwell GPUs (RTX 50-series, sm_120).
+# Older cu121 builds only cover up to sm_90 and fail on a 5080 with
+# "no kernel image is available for execution on the device".
 
-# --- PyTorch (CUDA 12.1 builds) ---
-torch==2.5.1+cu121
-torchaudio==2.5.1+cu121
-torchvision==0.20.1+cu121
+# --- PyTorch (CUDA 12.8 builds — required for RTX 50-series / Blackwell) ---
+torch==2.11.0+cu128
+torchaudio==2.11.0+cu128
+torchvision==0.26.0+cu128
 
 # --- Speech-to-text ---
 faster-whisper==1.2.1
