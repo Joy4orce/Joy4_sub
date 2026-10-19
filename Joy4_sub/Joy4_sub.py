@@ -643,6 +643,18 @@ def _mark_fail_if_no_srt(file):
     return False
 
 
+def _apply_row_rename(old_path, new_path):
+    """Tk main thread only. After filename translation renamed the media (and
+    its subtitle siblings), point the treeview row at the new path so status
+    detection and re-runs use the right file."""
+    for item in file_treeview.get_children():
+        values = list(file_treeview.item(item, 'values'))
+        if values and values[0] == old_path:
+            values[0] = new_path
+            file_treeview.item(item, values=tuple(values))
+            break
+
+
 def _reset_fail_rows():
     """Reset rows left on 'Fail' from a previous run back to 'Undone' so a
     re-run can mark them Done again. Must run on the Tk main thread."""
@@ -1323,7 +1335,18 @@ def proceed_multifile_whisperthread():
             new_basename = filename_rename_map.get(file)
             if new_basename:
                 if _find_sibling_subtitles(file):
-                    _rename_pair_for_file(file, new_basename)
+                    new_media_path = _rename_pair_for_file(file, new_basename)
+                    if new_media_path:
+                        # Keep file_list (this thread) and the treeview row
+                        # (main thread, via the queue) pointing at the NEW
+                        # path. Otherwise check_multifile_status keeps looking
+                        # for <old base>.srt, the row stays Undone forever, and
+                        # a re-run would try to open the old (gone) path.
+                        for idx, (p, _sp) in enumerate(file_list):
+                            if p == file:
+                                file_list[idx] = (new_media_path, new_media_path)
+                                break
+                        multifile_queue.put(("__file_renamed__", (file, new_media_path)))
                 else:
                     append_runtime_log(
                         f"Filename rename skipped (no subtitle siblings produced): {file}"
@@ -1386,6 +1409,9 @@ def multifile_update_from_queue():
             # finally block after the for-loop has finished (or been
             # cancelled). Consumer exits here.
             finished = True
+        elif kind == "__file_renamed__":
+            old_path, new_path = val
+            _apply_row_rename(old_path, new_path)
         elif kind == "__file_done__":
             # One file just completed (success or failure). Defer the
             # treeview status refresh until after the drain so multiple
