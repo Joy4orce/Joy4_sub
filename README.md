@@ -10,7 +10,7 @@ A Windows desktop tool that transcribes video/audio files with Whisper and trans
 
 ## Features
 
-- **Speech-to-text** with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and [openai-whisper](https://github.com/openai/whisper) (CUDA 12.1 supported)
+- **Speech-to-text** with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and [openai-whisper](https://github.com/openai/whisper) (CUDA 12.8 — supports RTX 50-series / Blackwell)
 - **Five translation engines**, switchable from the UI:
   - **DeepL** (API key)
   - **Claude Haiku** via Claude Code CLI (Pro/Team plan with automatic failover)
@@ -32,7 +32,7 @@ Supported media: `.mp3 .wav .aac .m4a .flac .mp4 .mkv .mov .avi .webm .ogg .opus
 ### Prerequisites
 - Windows 10 / 11
 - Python 3.10 (the setup script will offer to install it via `winget` if missing)
-- (Optional) NVIDIA GPU with CUDA 12.1 for fast Whisper transcription
+- (Optional) NVIDIA GPU with CUDA 12.8 for fast Whisper transcription (RTX 50-series / Blackwell supported)
 
 ### One-shot install
 
@@ -47,7 +47,7 @@ This creates `.venv-vatsg/`, installs all dependencies from `requirements-venv.t
 ```bash
 python -m venv .venv-vatsg
 .venv-vatsg\Scripts\activate
-pip install --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements-venv.txt
+pip install --extra-index-url https://download.pytorch.org/whl/cu128 -r requirements-venv.txt
 python Joy4_sub\Joy4_sub.py
 ```
 

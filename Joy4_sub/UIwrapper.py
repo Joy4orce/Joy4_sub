@@ -8,7 +8,8 @@ class UIwrapper:
                  local_endpoint="", local_model="", local_system_prompt="",
                  local_temperature=0.1, local_apikey="",
                  cancel_event=None,
-                 translate_filenames=False):
+                 translate_filenames=False,
+                 stt_engine="Whisper"):
         self.queue = queue
         self.lock = lock
         self.key = key  # legacy: active engine's keys (kept for compat)
@@ -41,6 +42,11 @@ class UIwrapper:
         # When True, multifile/single-file workers will rename media + srt
         # to the engine's translation of any Japanese basename.
         self.translate_filenames = translate_filenames
+        # Speech-to-text engine: "Whisper" (faster-whisper) or "Qwen3-ASR".
+        self.stt_engine = stt_engine
+
+    def get_stt_engine(self):
+        return self.stt_engine
 
     def is_cancelled(self):
         """True when the user has requested cancellation. Cheap to call —

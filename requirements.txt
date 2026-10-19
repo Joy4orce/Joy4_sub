@@ -4,6 +4,6 @@
 # This file mirrors it so that `pip install -r requirements.txt` also works.
 #
 # For CUDA 12.1 PyTorch wheels, install with:
-#   pip install --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements.txt
+#   pip install --extra-index-url https://download.pytorch.org/whl/cu128 -r requirements.txt
 
 -r requirements-venv.txt

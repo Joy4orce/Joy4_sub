@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import traceback
 
 from claudewrapper import ClaudeRateLimitError
 from geminiwrapper import GeminiAllKeysExhaustedError
@@ -19,6 +20,9 @@ from mywhisper import (
 # doesn't start with the prefix is treated as ordinary stdout and just
 # logged. ASCII-only so encoding never trips it up.
 PROGRESS_SENTINEL = "__J4S_PROG__"
+# Emitted once per job in --serve mode so the parent knows the job finished
+# (and with what exit-style code) without the process exiting.
+DONE_SENTINEL = "__J4S_DONE__"
 
 
 # Make sure stdout is UTF-8 and line-buffered so the parent can read complete
@@ -59,7 +63,7 @@ class WorkerUIWrapper:
                  gemini_model="", openai_model="",
                  claude_pro_token="", claude_team_token="", claude_default_plan="pro",
                  local_endpoint="", local_model="", local_system_prompt="",
-                 local_temperature=0.1, local_apikey=""):
+                 local_temperature=0.1, local_apikey="", stt_engine="Whisper"):
         self.api_key = api_key  # legacy
         self.cuda_enabled = cuda_enabled
         self.model_name = model_name
@@ -81,6 +85,10 @@ class WorkerUIWrapper:
         self.local_system_prompt = local_system_prompt
         self.local_temperature = local_temperature
         self.local_apikey = local_apikey
+        self.stt_engine = stt_engine
+
+    def get_stt_engine(self):
+        return self.stt_engine
 
     def update_percentagelabel_post(self, text, value):
         # Forward to parent UI through the stdout sentinel channel (when
@@ -171,8 +179,11 @@ class WorkerUIWrapper:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--file", required=True)
-    parser.add_argument("--temp-audio", required=True)
+    # In --serve mode jobs arrive on stdin, so these are optional there.
+    parser.add_argument("--file", default="")
+    parser.add_argument("--temp-audio", default="")
+    parser.add_argument("--serve", action="store_true",
+                        help="persistent mode: read one JSON job per stdin line")
     parser.add_argument("--api-key", default="")  # legacy compat
     parser.add_argument("--model", required=True)
     parser.add_argument("--source-lang", default="")
@@ -181,25 +192,93 @@ def parse_args():
     parser.add_argument("--fast", action="store_true")
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--engine", default="DeepL")
-    parser.add_argument("--deepl-key", default="")
-    parser.add_argument("--gemini-keys", default="")
-    parser.add_argument("--openai-keys", default="")
+    # Secrets are delivered via environment (never argv — argv is world-
+    # readable on the machine); the flags remain only as a fallback.
+    parser.add_argument("--deepl-key", default=os.environ.get("JOY4SUB_DEEPL_KEY", ""))
+    parser.add_argument("--gemini-keys", default=os.environ.get("JOY4SUB_GEMINI_KEYS", ""))
+    parser.add_argument("--openai-keys", default=os.environ.get("JOY4SUB_OPENAI_KEYS", ""))
     parser.add_argument("--gemini-model", default="")
     parser.add_argument("--openai-model", default="")
-    parser.add_argument("--claude-pro-token", default="")
-    parser.add_argument("--claude-team-token", default="")
+    parser.add_argument("--claude-pro-token", default=os.environ.get("JOY4SUB_CLAUDE_PRO_TOKEN", ""))
+    parser.add_argument("--claude-team-token", default=os.environ.get("JOY4SUB_CLAUDE_TEAM_TOKEN", ""))
     parser.add_argument("--claude-default-plan", default="pro")
     parser.add_argument("--local-endpoint", default="")
     parser.add_argument("--local-model", default="")
     parser.add_argument("--local-system-prompt", default="")
     parser.add_argument("--local-temperature", default="0.1")
-    parser.add_argument("--local-apikey", default="")
+    parser.add_argument("--local-apikey", default=os.environ.get("JOY4SUB_LOCAL_APIKEY", ""))
+    parser.add_argument("--stt-engine", default="Whisper")
     return parser.parse_args()
+
+
+def _run_job(args, uiwrapper, file, temp_audio):
+    """Transcribe + translate one file.
+
+    Returns an exit-style code the parent already understands:
+      0 = ok, 1 = failed, 2 = rate-limited / all keys exhausted (parent waits
+      for the user, then re-sends the same job).
+    """
+    append_runtime_log(f"Worker subprocess started for {file}")
+    try:
+        if args.fast:
+            transcribe_from_mp3_fast_whisper(file, temp_audio, uiwrapper)
+        else:
+            transcribe_from_mp3_whisper(file, temp_audio, uiwrapper)
+    except ClaudeRateLimitError:
+        append_runtime_log(f"Worker subprocess: Claude rate limit reached for {file}")
+        return 2
+    except GeminiAllKeysExhaustedError:
+        append_runtime_log(f"Worker subprocess: All Gemini keys exhausted for {file}")
+        return 2
+    except OpenAIAllKeysExhaustedError:
+        append_runtime_log(f"Worker subprocess: All ChatGPT keys exhausted for {file}")
+        return 2
+    except Exception as exc:
+        # Same observable behaviour as before (traceback on stderr, code 1),
+        # but the serving process survives to take the next file.
+        append_runtime_log(f"Worker subprocess: job failed for {file}: {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        return 1
+    append_runtime_log(f"Worker subprocess finished for {file}")
+    return 0
+
+
+def _serve(args, uiwrapper):
+    """Persistent mode: one JSON job per stdin line -> run -> DONE line.
+
+    Keeping this process alive across a batch is what removes the 6-10 s
+    per-file startup cost (torch import + model reload + CUDA init): torch
+    stays imported and mywhisper's model cache is reused file after file.
+    """
+    try:
+        sys.stdin.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+    append_runtime_log("Worker subprocess entering serve mode")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            job = json.loads(line)
+        except Exception:
+            append_runtime_log(f"Worker serve: ignoring malformed job line: {line[:120]}")
+            continue
+        if job.get("cmd") == "quit":
+            break
+        file = job.get("file", "")
+        temp_audio = job.get("temp_audio", "")
+        code = _run_job(args, uiwrapper, file, temp_audio)
+        try:
+            sys.stdout.write(DONE_SENTINEL + json.dumps({"file": file, "code": code}, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+        except Exception:
+            append_runtime_log("Worker serve: failed to report job completion")
+    append_runtime_log("Worker subprocess leaving serve mode")
 
 
 def main():
     args = parse_args()
-    append_runtime_log(f"Worker subprocess started for {args.file}")
     try:
         local_temp = float(args.local_temperature)
     except (TypeError, ValueError):
@@ -227,24 +306,17 @@ def main():
         local_system_prompt=args.local_system_prompt,
         local_temperature=local_temp,
         local_apikey=args.local_apikey,
+        stt_engine=args.stt_engine,
     )
 
-    try:
-        if args.fast:
-            transcribe_from_mp3_fast_whisper(args.file, args.temp_audio, uiwrapper)
-        else:
-            transcribe_from_mp3_whisper(args.file, args.temp_audio, uiwrapper)
-    except ClaudeRateLimitError:
-        append_runtime_log(f"Worker subprocess: Claude rate limit reached for {args.file}")
-        sys.exit(2)
-    except GeminiAllKeysExhaustedError:
-        append_runtime_log(f"Worker subprocess: All Gemini keys exhausted for {args.file}")
-        sys.exit(2)
-    except OpenAIAllKeysExhaustedError:
-        append_runtime_log(f"Worker subprocess: All ChatGPT keys exhausted for {args.file}")
-        sys.exit(2)
+    if args.serve:
+        _serve(args, uiwrapper)
+        return
 
-    append_runtime_log(f"Worker subprocess finished for {args.file}")
+    if not args.file or not args.temp_audio:
+        sys.stderr.write("--file and --temp-audio are required unless --serve is given\n")
+        sys.exit(1)
+    sys.exit(_run_job(args, uiwrapper, args.file, args.temp_audio))
 
 
 if __name__ == "__main__":

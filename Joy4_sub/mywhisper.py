@@ -1,13 +1,13 @@
-import glob
 import os
 import gc
 from datetime import datetime
 
-import stable_whisper
 import torch
-import whisper
-from faster_whisper import WhisperModel
-from whisper.utils import get_writer
+from faster_whisper import WhisperModel, BatchedInferencePipeline
+# NOTE: `stable_whisper` is imported lazily inside transcribe_stable_whisper —
+# it (and openai-whisper) cost ~2.3 s per import and only the rarely used
+# non-fast path needs them. The GUI and every worker used to pay that on
+# startup for nothing.
 
 from claudewrapper import ClaudeRateLimitError, ClaudeSafetyRefusalError, translateusingclaude
 from deeplwrapper import translateusingapi, translateusingapifortest
@@ -18,7 +18,36 @@ from extractaudio import extract_audio_for_transcription, get_media_length_in_se
 from settings import get_settings_path
 from utility import format_seconds
 
-retained_cuda_models = []
+# Model cache keyed by (kind, model name, device). Reusing a loaded model
+# across files is what makes the persistent worker fast (no 2-4 s reload per
+# file). It also replaces the old append-only `retained_cuda_models` list,
+# which never reused anything and leaked one whole model per file until the
+# batch ended (VRAM exhaustion after a handful of files on the non-fast path).
+_model_cache = {}
+
+
+def _get_whisper_model(option, use_gpu):
+    key = ("faster", option, "cuda" if use_gpu else "cpu")
+    model = _model_cache.get(key)
+    if model is None:
+        if use_gpu:
+            model = WhisperModel(option, device="cuda", compute_type="float16")
+        else:
+            model = WhisperModel(option, device="cpu", compute_type="int8")
+        _model_cache[key] = model
+        append_runtime_log(f"Loaded faster-whisper '{option}' on {key[2]} (cached for reuse)")
+    return model
+
+
+def _get_stable_model(option, use_gpu):
+    import stable_whisper  # lazy: ~2 s import that only this path needs
+    key = ("stable", option, "cuda" if use_gpu else "cpu")
+    model = _model_cache.get(key)
+    if model is None:
+        model = stable_whisper.load_model(option, device="cuda" if use_gpu else "cpu")
+        _model_cache[key] = model
+        append_runtime_log(f"Loaded stable-whisper '{option}' on {key[2]} (cached for reuse)")
+    return model
 
 
 def dispatch_translate(text, uiwrapper):
@@ -42,6 +71,28 @@ def append_runtime_log(message):
         log_file.write(f"[{timestamp}] {message}\n")
 
 
+def _safe_media_seconds(file):
+    """Media duration in seconds, for progress-bar scaling ONLY. Never raises.
+
+    Some real files fail duration probing yet still transcribe fine via
+    faster-whisper's own decoder: non-RIFF .wav files (Python's wave module
+    rejects them) and mp3s whose ffmpeg stderr moviepy can't parse. Previously
+    the raised exception here crashed the whole worker before any subtitle was
+    written, which — combined with the multifile loop aborting on the first
+    worker failure — made an entire batch "complete nothing". Returns 0.0 on
+    failure; callers MUST treat 0 as "unknown" and never divide by it.
+    """
+    try:
+        seconds = get_media_length_in_seconds(file)
+        return seconds if seconds and seconds > 0 else 0.0
+    except Exception as exc:
+        append_runtime_log(
+            f"Media length probe failed for {file}: {type(exc).__name__}: {exc}; "
+            f"progress bar will be approximate"
+        )
+        return 0.0
+
+
 def clear_gpu_memory():
     gc.collect()
     if torch.cuda.is_available():
@@ -56,8 +107,14 @@ def should_skip_immediate_gpu_cleanup(uiwrapper):
 
 
 def release_retained_cuda_models():
-    global retained_cuda_models
-    retained_cuda_models.clear()
+    """Drop every cached model (Whisper + Qwen) and free GPU memory. Called
+    at batch end / single-file end so VRAM is returned to the system."""
+    _model_cache.clear()
+    try:
+        import qwenasr
+        qwenasr.unload()
+    except Exception:
+        pass
     clear_gpu_memory()
 
 
@@ -254,66 +311,102 @@ def translate_srt_file(transcribed_srt_path, translated_srt_path, uiwrapper):
     return True
 
 
-def transcribe_fast_whisper(file, option, uiwrapper, output_base=None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    append_runtime_log(f"Fast whisper started for {file} on {device.type}")
+# --- Batched transcription (faster-whisper BatchedInferencePipeline) ---
+# ~4x faster than sequential decoding on GPU with the same accuracy. It chunks
+# audio with Silero VAD, so a too-aggressive VAD could drop very quiet speech —
+# a real risk for whispered ASMR. We therefore use a SENSITIVE VAD (low
+# threshold + generous padding) so soft passages survive. Flip
+# USE_BATCHED_TRANSCRIPTION to False to fall back to plain sequential decoding.
+USE_BATCHED_TRANSCRIPTION = True
+BATCH_SIZE = 16  # RTX 5080 (16GB) handles this easily at large-v3-turbo / fp16
+# Low threshold catches whispers; keep short silences + padding so soft speech
+# isn't merged away. Lower `threshold` further (e.g. 0.1) if quiet lines vanish.
+_ASMR_VAD_PARAMETERS = dict(threshold=0.2, min_silence_duration_ms=500, speech_pad_ms=400)
 
-    model = None
-    try:
-        if uiwrapper.get_cuda_var() and device.type == "cuda":
-            model = WhisperModel(option, device="cuda", compute_type="float16")
-        else:
-            model = WhisperModel(option, device="cpu", compute_type="int8")
 
-        srtfile = (output_base or os.path.splitext(file)[0]) + ".srt"
-        if uiwrapper.get_srclanguagecodeinput() == "":
-            segments, _ = model.transcribe(file, beam_size=5, word_timestamps=True,
-                                           condition_on_previous_text=False)
-        else:
-            segments, _ = model.transcribe(
+def _fw_transcribe(model, file, uiwrapper, use_gpu):
+    """Return a faster-whisper segments iterator, using the batched pipeline on
+    GPU for a large speedup and falling back to sequential decoding otherwise.
+
+    word_timestamps stays on so SRT alignment is identical to before. The
+    batched pipeline decodes each VAD chunk independently, so
+    condition_on_previous_text does not apply there (and is only passed to the
+    sequential path)."""
+    src_lang = uiwrapper.get_srclanguagecodeinput() or None
+
+    if USE_BATCHED_TRANSCRIPTION and use_gpu:
+        try:
+            pipeline = BatchedInferencePipeline(model=model)
+            append_runtime_log(
+                f"Transcribing with BatchedInferencePipeline (batch_size={BATCH_SIZE}, "
+                f"vad_threshold={_ASMR_VAD_PARAMETERS['threshold']})"
+            )
+            uiwrapper.update_percentagelabel_post("text", "Transcribing (batched)...")
+            segments, _info = pipeline.transcribe(
                 file,
+                batch_size=BATCH_SIZE,
                 beam_size=5,
                 word_timestamps=True,
-                language=uiwrapper.get_srclanguagecodeinput(),
-                condition_on_previous_text=False,
+                language=src_lang,
+                vad_parameters=_ASMR_VAD_PARAMETERS,
             )
+            # pipeline.transcribe() returns a LAZY generator: the actual GPU
+            # decoding (and any CUDA OOM) only happens while iterating. Drain
+            # it here, inside the try, so a decode failure really does fall
+            # back to sequential decoding instead of escaping to the caller's
+            # SRT-writing loop with no fallback at all.
+            return list(segments)
+        except Exception as exc:
+            append_runtime_log(
+                f"Batched pipeline failed ({type(exc).__name__}: {exc}); "
+                f"falling back to sequential decoding"
+            )
+            uiwrapper.update_percentagelabel_post("text", "Batched failed; sequential decoding...")
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
+    segments, _info = model.transcribe(
+        file,
+        beam_size=5,
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        **({"language": src_lang} if src_lang else {}),
+    )
+    return segments
 
-        if os.path.exists(srtfile):
-            os.remove(srtfile)
 
-        try:
-            with open(srtfile, "a", encoding="utf8") as srt_output:
-                for index, segment in enumerate(segments, start=1):
-                    if segment.no_speech_prob > 0.6:
-                        continue
-                    translated_string = dispatch_translate(segment.text, uiwrapper)
-                    if translated_string:
-                        srt_output.write(
-                            f"{index}\n{format_seconds(segment.start)} --> {format_seconds(segment.end)}\n{translated_string}\n\n"
-                        )
-                    uiwrapper.update_progressbar("value", segment.end)
-                    uiwrapper.update_percentagelabel_post("text", "{:.2f}%".format((segment.end / allseconds) * 100))
-        except ClaudeRateLimitError:
-            if os.path.exists(srtfile):
-                os.remove(srtfile)
-                append_runtime_log(f"Deleted incomplete SRT due to rate limit: {srtfile}")
-            raise
+def _stt_engine(uiwrapper):
+    """Which speech-to-text engine to use: 'Whisper' (default) or 'Qwen3-ASR'."""
+    getter = getattr(uiwrapper, "get_stt_engine", None)
+    if getter is None:
+        return "Whisper"
+    try:
+        return (getter() or "Whisper")
+    except Exception:
+        return "Whisper"
 
-        uiwrapper.update_percentagelabel_post("text", "Finished")
-    finally:
-        if model is not None:
-            if should_skip_immediate_gpu_cleanup(uiwrapper):
-                retained_cuda_models.append(model)
-                append_runtime_log(f"Retained CUDA model after fast whisper for {file}")
-            else:
-                del model
-        if should_skip_immediate_gpu_cleanup(uiwrapper):
-            append_runtime_log(f"Skipping immediate GPU cleanup after fast whisper for {file}")
-        else:
-            clear_gpu_memory()
+
+class _QwenSeg:
+    """Adapts a Qwen3-ASR (start, end, text) tuple to the same shape as a
+    faster-whisper segment so the existing SRT-writing loops work unchanged.
+    no_speech_prob is 0.0 (Qwen only returns real speech windows via VAD)."""
+    __slots__ = ("start", "end", "text", "no_speech_prob")
+
+    def __init__(self, start, end, text):
+        self.start = start
+        self.end = end
+        self.text = text
+        self.no_speech_prob = 0.0
+
+
+def _qwen_segments(file, uiwrapper):
+    """Transcribe with Qwen3-ASR, returning whisper-segment-shaped objects."""
+    from qwenasr import transcribe_qwen
+    append_runtime_log(f"Transcribing with Qwen3-ASR: {file}")
+    return [_QwenSeg(s, e, t) for s, e, t in transcribe_qwen(file, uiwrapper)]
 
 
 def transcribe_fast_whisper_differently(file, option, uiwrapper, output_base=None):
@@ -322,29 +415,19 @@ def transcribe_fast_whisper_differently(file, option, uiwrapper, output_base=Non
 
     model = None
     try:
-        if uiwrapper.get_cuda_var() and device.type == "cuda":
-            model = WhisperModel(option, device="cuda", compute_type="float16")
-        else:
-            model = WhisperModel(option, device="cpu", compute_type="int8")
-
         final_base = output_base or os.path.splitext(file)[0]
         translatedsrtfile = final_base + ".srt"
         transcribedsrtfile = final_base + "_original.srt"
 
-        if uiwrapper.get_srclanguagecodeinput() == "":
-            segments, _ = model.transcribe(file, beam_size=5, word_timestamps=True,
-                                           condition_on_previous_text=False)
+        if _stt_engine(uiwrapper) == "Qwen3-ASR":
+            segments = _qwen_segments(file, uiwrapper)
         else:
-            segments, _ = model.transcribe(
-                file,
-                beam_size=5,
-                word_timestamps=True,
-                language=uiwrapper.get_srclanguagecodeinput(),
-                condition_on_previous_text=False,
-            )
+            use_gpu = uiwrapper.get_cuda_var() and device.type == "cuda"
+            model = _get_whisper_model(option, use_gpu)
+            segments = _fw_transcribe(model, file, uiwrapper, use_gpu)
 
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
+        allseconds = _safe_media_seconds(file)
+        uiwrapper.update_progressbar("maximum", allseconds or 1)
 
         with open(transcribedsrtfile, "w", encoding="utf8") as srt_output:
             for index, segment in enumerate(segments, start=1):
@@ -354,7 +437,7 @@ def transcribe_fast_whisper_differently(file, option, uiwrapper, output_base=Non
                     f"{index}\n{format_seconds(segment.start)} --> {format_seconds(segment.end)}\n{segment.text.strip()}\n\n"
                 )
                 uiwrapper.update_progressbar("value", segment.end)
-                uiwrapper.update_percentagelabel_post("text", "{:.2f}%".format((segment.end / allseconds) * 100))
+                uiwrapper.update_percentagelabel_post("text", "{:.2f}%".format((segment.end / allseconds) * 100) if allseconds else "Transcribing...")
 
         append_runtime_log(f"Finished transcription stage for {file}")
         uiwrapper.update_percentagelabel_post("text", "Transcription done, starting translation...")
@@ -376,72 +459,10 @@ def transcribe_fast_whisper_differently(file, option, uiwrapper, output_base=Non
         append_runtime_log(f"Leaving fast whisper batch function for {file}")
         uiwrapper.update_percentagelabel_post("text", "Finished")
     finally:
-        if model is not None:
-            if should_skip_immediate_gpu_cleanup(uiwrapper):
-                retained_cuda_models.append(model)
-                append_runtime_log(f"Retained CUDA model after fast whisper batch for {file}")
-            else:
-                del model
-        if should_skip_immediate_gpu_cleanup(uiwrapper):
-            append_runtime_log(f"Skipping immediate GPU cleanup after fast whisper batch for {file}")
-        else:
-            clear_gpu_memory()
-
-
-def transcribe_whisper(file, option, uiwrapper, output_base=None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    append_runtime_log(f"Whisper started for {file} on {device.type}")
-
-    model = None
-    try:
-        if uiwrapper.get_cuda_var() and device.type == "cuda":
-            model = whisper.load_model(option, device="cuda")
-        else:
-            model = whisper.load_model(option, device="cpu")
-
-        final_base = output_base or os.path.splitext(file)[0]
-        transcribedsrtfile = final_base + "_original.srt"
-        translatedsrtfile = final_base + ".srt"
-
-        if uiwrapper.get_srclanguagecodeinput() == "":
-            result = model.transcribe(file, verbose=True)
-        else:
-            result = model.transcribe(file, verbose=True, language=uiwrapper.get_srclanguagecodeinput())
-
-        writer = get_writer("srt", os.path.dirname(transcribedsrtfile) or ".")
-        writer(result, transcribedsrtfile)
-
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
-
-        append_runtime_log(f"Finished whisper transcription stage for {file}")
-        uiwrapper.update_percentagelabel_post("text", "Transcription done, starting translation...")
-
-        try:
-            translated = translate_srt_file(transcribedsrtfile, translatedsrtfile, uiwrapper)
-        except ClaudeRateLimitError:
-            if os.path.exists(translatedsrtfile):
-                os.remove(translatedsrtfile)
-                append_runtime_log(f"Deleted incomplete translated SRT: {translatedsrtfile}")
-            if not uiwrapper.get_original_var() and os.path.exists(transcribedsrtfile):
-                os.remove(transcribedsrtfile)
-                append_runtime_log(f"Deleted intermediate transcribed SRT: {transcribedsrtfile}")
-            raise
-
-        if translated and not uiwrapper.get_original_var() and os.path.exists(transcribedsrtfile):
-            os.remove(transcribedsrtfile)
-
-        uiwrapper.update_percentagelabel_post("text", "Finished")
-    finally:
-        if model is not None:
-            if should_skip_immediate_gpu_cleanup(uiwrapper):
-                retained_cuda_models.append(model)
-                append_runtime_log(f"Retained CUDA model after whisper for {file}")
-            else:
-                del model
-        if should_skip_immediate_gpu_cleanup(uiwrapper):
-            append_runtime_log(f"Skipping immediate GPU cleanup after whisper for {file}")
-        else:
+        # The model stays in _model_cache for the next file; the cache is
+        # cleared (and VRAM freed) by release_retained_cuda_models() at batch
+        # end. Nothing per-file to free on the GPU path.
+        if not should_skip_immediate_gpu_cleanup(uiwrapper):
             clear_gpu_memory()
 
 
@@ -456,10 +477,8 @@ def transcribe_stable_whisper(file, option, uiwrapper, output_base=None):
 
     model = None
     try:
-        if uiwrapper.get_cuda_var() and device.type == "cuda":
-            model = stable_whisper.load_model(option, device="cuda")
-        else:
-            model = stable_whisper.load_model(option, device="cpu")
+        use_gpu = uiwrapper.get_cuda_var() and device.type == "cuda"
+        model = _get_stable_model(option, use_gpu)
 
         final_base = output_base or os.path.splitext(file)[0]
         transcribedsrtfile = final_base + "_original.srt"
@@ -476,8 +495,8 @@ def transcribe_stable_whisper(file, option, uiwrapper, output_base=None):
             )
         result.to_srt_vtt(transcribedsrtfile, word_level=False)
 
-        allseconds = get_media_length_in_seconds(file)
-        uiwrapper.update_progressbar("maximum", allseconds)
+        allseconds = _safe_media_seconds(file)
+        uiwrapper.update_progressbar("maximum", allseconds or 1)
 
         append_runtime_log(f"Finished stable whisper transcription stage for {file}")
         uiwrapper.update_percentagelabel_post("text", "Transcription done, starting translation...")
@@ -498,23 +517,9 @@ def transcribe_stable_whisper(file, option, uiwrapper, output_base=None):
 
         uiwrapper.update_percentagelabel_post("text", "Finished")
     finally:
-        if model is not None:
-            if should_skip_immediate_gpu_cleanup(uiwrapper):
-                retained_cuda_models.append(model)
-                append_runtime_log(f"Retained CUDA model after stable whisper for {file}")
-            else:
-                del model
-        if should_skip_immediate_gpu_cleanup(uiwrapper):
-            append_runtime_log(f"Skipping immediate GPU cleanup after stable whisper for {file}")
-        else:
+        # See transcribe_fast_whisper_differently: model is cached for reuse.
+        if not should_skip_immediate_gpu_cleanup(uiwrapper):
             clear_gpu_memory()
-
-
-def transcribebypatterns(filepattern, options, uiwrapper):
-    matching_files = glob.glob(filepattern)
-    for matched_file in matching_files:
-        audio_file = os.path.splitext(matched_file)[0] + ".mp3"
-        transcribe_from_mp3_fast_whisper(matched_file, audio_file, uiwrapper)
 
 
 def transcribe_from_mp3_whisper(file1, file2, uiwrapper):

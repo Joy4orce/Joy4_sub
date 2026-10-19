@@ -1,6 +1,7 @@
 import locale
 import tkinter
 import tkinter.ttk
+import tkinter.font as tkfont
 import uuid
 from tkinter import *
 from tkinter import filedialog
@@ -12,14 +13,11 @@ import json
 import os
 import re
 import subprocess
-import tqdm
 import traceback
 from datetime import datetime
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-import whisper
-import stable_whisper
 
 import UIwrapper
 import localization
@@ -28,7 +26,7 @@ import sys
 import queue
 
 from extractaudio import get_media_length_in_time, get_supported_media_extensions, is_supported_media
-from utility import get_file_size_in_mb, treeview_sort_column, sort_by_path, shorten_path
+from utility import get_file_size_in_mb, treeview_sort_column, sort_by_path
 from settings import (
     load_settings, load_apikey, settingjson, save_apikey, get_settings_path,
     save_engine_apikey, load_engine_apikey, run_first_run_migrations,
@@ -175,6 +173,8 @@ original_var = tkinter.BooleanVar()
 fast_var = tkinter.BooleanVar(value=True)
 
 translation_engine_var = tkinter.StringVar(value="DeepL")
+# Speech-to-text engine: "Whisper" (faster-whisper) or "Qwen3-ASR".
+stt_engine_var = tkinter.StringVar(value="Whisper")
 
 # Opt-in: when ON, rename every media file whose basename contains
 # Japanese characters to its translated form after that file's SRT
@@ -475,6 +475,10 @@ def _rename_pair_for_file(media_path, new_basename):
     )
     return new_media_path
 multifile_status_indicator = 0
+# Full paths of files whose worker failed during the current batch. Read by
+# check_multifile_status() (main thread) to mark those rows "Fail" instead of
+# leaving them stuck on "Undone". Cleared at the start of each batch run.
+multifile_failed_paths = set()
 supported_media_extensions = set(get_supported_media_extensions())
 
 
@@ -499,44 +503,88 @@ def split_dnd_files(raw_data):
     return [path for path in window.tk.splitlist(raw_data) if path]
 
 
+def _autosize_path_column():
+    """Widen the path column to fit the longest queued path so the horizontal
+    scrollbar can pan across the entire path. Bounded so a pathological path
+    can't create an absurdly wide column. Safe to call anytime after the UI is
+    built; a no-op if the list is empty."""
+    try:
+        cell_font = tkfont.nametofont("TkDefaultFont")
+    except Exception:
+        return
+    longest = 0
+    for path, _spath in file_list:
+        longest = max(longest, cell_font.measure(path))
+    # +24px padding for cell margins; clamp to a sane range.
+    target = min(max(longest + 24, 300), 6000)
+    file_treeview.column(localization.getstr("path"), width=target)
+
+
+from concurrent.futures import ThreadPoolExecutor
+
+# Media-length probes (an `ffmpeg -i` per file, ~50 ms warm / ~0.5 s cold) run
+# OFF the Tk thread. Adding a 500-file folder used to block the UI for 25-30 s
+# ("not responding"); now rows appear instantly with a placeholder and the
+# length column fills in as probes complete. 8 workers ~ 8x faster overall.
+_probe_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="media-probe")
+
+
+# Probe results cross back to the Tk thread through a queue drained by a
+# periodic after() loop. (Calling window.after() directly from a worker
+# thread is not thread-safe in Tkinter and is silently dropped.)
+_probe_results = queue.Queue()
+
+
+def _apply_probed_length(iid, length_text):
+    """Tk main thread only. The row may have been deleted before the probe
+    finished."""
+    if not file_treeview.exists(iid):
+        return
+    values = list(file_treeview.item(iid, 'values'))
+    if len(values) >= 3:
+        values[2] = length_text
+        file_treeview.item(iid, values=tuple(values))
+
+
+def _drain_probe_results():
+    try:
+        while True:
+            iid, length_text = _probe_results.get_nowait()
+            _apply_probed_length(iid, length_text)
+    except queue.Empty:
+        pass
+    window.after(150, _drain_probe_results)
+
+
+window.after(150, _drain_probe_results)
+
+
 def add_media_file_to_list(file_path):
+    iid = str(uuid.uuid4())
     file_treeview.insert(
         parent='',
         index=tkinter.END,
-        iid=uuid.uuid4(),
+        iid=iid,
         values=[
-            shorten_path(file_path),
+            file_path,
             str(get_file_size_in_mb(file_path)) + "MB",
-            get_media_length_in_time(file_path),
+            "...",  # length is filled in asynchronously by the probe below
             "Undone",
         ],
     )
-    file_list.append((file_path, shorten_path(file_path)))
+    # Second element is the treeview's displayed path value; it is compared
+    # against item_values[0] for delete/status lookups, so it MUST match what
+    # is shown. Now that we show the full path, store the full path here too.
+    file_list.append((file_path, file_path))
 
-def get_active_progress_queue():
-    return multifile_queue if multi_processing else update_queue
+    def _probe():
+        try:
+            length = get_media_length_in_time(file_path)
+        except Exception:
+            length = "Unknown"
+        _probe_results.put((iid, length))
+    _probe_executor.submit(_probe)
 
-class _CustomProgressBar(tqdm.tqdm):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._current = self.n  # Set the initial value
-
-    def update(self, n):
-        super().update(n)
-        self._current += n
-        active_queue = get_active_progress_queue()
-        percentage = "{:.2f}".format(round((self._current / self.total) * 100, 2)) + "%"
-        with lock:
-            active_queue.put(("maximum", self.total))
-            active_queue.put(("value", self._current))
-            active_queue.put(("text", percentage))
-
-
-transcribe_module = sys.modules['whisper.transcribe']
-transcribe_module.tqdm.tqdm = _CustomProgressBar
-
-#stable_transcribe_module = sys.modules['stable_whisper.whisper_word_level']
-#stable_transcribe_module.tqdm = _CustomProgressBar
 
 
 
@@ -549,6 +597,7 @@ def on_delete_key_press(event):
                 file_list.remove((path, spath))
         file_treeview.delete(item)
     multifile_list_label['text'] = "0/" + str(len(file_list))
+    _autosize_path_column()
 
 def check_multifile_status():
     # Build the spath -> path map once (O(N)) instead of scanning the
@@ -563,7 +612,7 @@ def check_multifile_status():
 
     for item in file_treeview.get_children():
         item_value = list(file_treeview.item(item, 'values'))
-        if len(item_value) >= 4 and item_value[3] == "Done":
+        if len(item_value) >= 4 and item_value[3] in ("Done", "Fail"):
             continue
         path = path_by_spath.get(item_value[0])
         if path is None:
@@ -572,6 +621,49 @@ def check_multifile_status():
         if os.path.exists(base + ".srt"):
             item_value[3] = "Done"
             file_treeview.item(item, values=tuple(item_value))
+        elif path in multifile_failed_paths:
+            # Worker crashed on this file (e.g. unreadable/corrupt media).
+            # Surface it as Fail so the user can see WHICH files were skipped
+            # instead of them sitting on "Undone" forever.
+            item_value[3] = "Fail"
+            file_treeview.item(item, values=tuple(item_value))
+
+def _mark_fail_if_no_srt(file):
+    """A worker/in-process run that finished without raising can still have
+    produced no translated subtitle (missing API key, parse failure, Local LLM
+    down, DeepL quota, ...). Treat "no .srt next to the media" as a failure so
+    the row shows Fail instead of sitting on Undone while the batch says
+    Finished. Called right after each file completes, BEFORE any rename."""
+    expected = os.path.splitext(file)[0] + ".srt"
+    if not os.path.exists(expected):
+        multifile_failed_paths.add(file)
+        append_runtime_log(f"No subtitle produced for {file}; marking Fail")
+        multifile_queue.put(("text", f"번역 실패 (건너뜀): {os.path.basename(file)}"))
+        return True
+    return False
+
+
+def _apply_row_rename(old_path, new_path):
+    """Tk main thread only. After filename translation renamed the media (and
+    its subtitle siblings), point the treeview row at the new path so status
+    detection and re-runs use the right file."""
+    for item in file_treeview.get_children():
+        values = list(file_treeview.item(item, 'values'))
+        if values and values[0] == old_path:
+            values[0] = new_path
+            file_treeview.item(item, values=tuple(values))
+            break
+
+
+def _reset_fail_rows():
+    """Reset rows left on 'Fail' from a previous run back to 'Undone' so a
+    re-run can mark them Done again. Must run on the Tk main thread."""
+    for item in file_treeview.get_children():
+        item_value = list(file_treeview.item(item, 'values'))
+        if len(item_value) >= 4 and item_value[3] == "Fail":
+            item_value[3] = "Undone"
+            file_treeview.item(item, values=tuple(item_value))
+
 
 def list_label_indicate( number = 0):
     multifile_queue.put(('list', str(number) + "/" + str(len(file_list))))
@@ -589,22 +681,16 @@ def on_filetap_drop(event):
 
 
 def on_drop(event):
-    dropped_files = split_dnd_files(event.data)
-    unsupported_files = [file for file in dropped_files if not is_supported_media(file)]
-    supported_files = [file for file in dropped_files if is_supported_media(file)]
-
-    if unsupported_files:
-        show_unsupported_media_message(unsupported_files)
-
-    existing_paths = {os.path.normcase(os.path.abspath(p)) for p, _ in file_list}
-    for file_path in supported_files:
-        norm = os.path.normcase(os.path.abspath(file_path))
-        if norm in existing_paths:
-            continue
-        existing_paths.add(norm)
-        add_media_file_to_list(file_path)
-
-    multifile_list_label['text'] = "0/" + str(len(file_list))
+    # Accepts BOTH files and folders. Dropped folders are expanded recursively
+    # (same as the "Add Folder" button), so all four add methods are supported.
+    dropped = split_dnd_files(event.data)
+    added, duplicates, skipped_existing, unsupported = _ingest_media_paths(dropped)
+    append_runtime_log(
+        f"Drag-drop: {added} added, {duplicates} duplicate(s), "
+        f"{skipped_existing} already-subtitled skipped"
+    )
+    if unsupported:
+        show_unsupported_media_message(unsupported)
 
 
 def _collect_media_files_recursively(folder_path):
@@ -641,6 +727,70 @@ def _has_existing_subtitle(media_path):
     return any(os.path.exists(c) for c in candidates)
 
 
+def _ingest_media_paths(paths):
+    """Add a mix of files and folders to the multifile queue.
+
+    Shared by all four add methods (Add File button, file drag-drop, Add
+    Folder button, folder drag-drop) so they behave identically:
+    - Folders are walked recursively; their media files are imported like the
+      "Add Folder" button (files that already have a subtitle are skipped).
+    - Files supplied directly are added as-is (only exact duplicates skipped),
+      because the user explicitly chose them.
+
+    Returns (added, duplicates, skipped_existing, unsupported_paths).
+    """
+    candidates = []  # (media_path, came_from_folder)
+    unsupported = []
+    for p in paths:
+        if not p:
+            continue
+        if os.path.isdir(p):
+            for found in _collect_media_files_recursively(p):
+                candidates.append((found, True))
+        elif is_supported_media(p):
+            candidates.append((p, False))
+        else:
+            unsupported.append(p)
+
+    existing_paths = {os.path.normcase(os.path.abspath(p)) for p, _ in file_list}
+    added = duplicates = skipped_existing = 0
+    for media_path, from_folder in candidates:
+        norm = os.path.normcase(os.path.abspath(media_path))
+        if norm in existing_paths:
+            duplicates += 1
+            continue
+        if from_folder and _has_existing_subtitle(media_path):
+            skipped_existing += 1
+            continue
+        existing_paths.add(norm)
+        add_media_file_to_list(media_path)
+        added += 1
+
+    multifile_list_label['text'] = "0/" + str(len(file_list))
+    _autosize_path_column()
+    return added, duplicates, skipped_existing, unsupported
+
+
+def add_files_to_multifile():
+    """Add one or more media files to the multifile queue via a file picker."""
+    files = filedialog.askopenfilenames(
+        title=localization.getstr('add_file_dialog_title'),
+        initialdir=defaultdir,
+        filetypes=[
+            ("Supported media", " ".join(f"*{ext}" for ext in sorted(supported_media_extensions))),
+            ("All files", "*.*"),
+        ],
+    )
+    if not files:
+        return
+    # askopenfilenames may return a Tcl list string on some platforms.
+    files = list(window.tk.splitlist(files))
+    added, duplicates, skipped_existing, unsupported = _ingest_media_paths(files)
+    append_runtime_log(f"Add File: {added} added, {duplicates} duplicate(s) skipped")
+    if unsupported:
+        show_unsupported_media_message(unsupported)
+
+
 def add_folder_to_multifile():
     """Let the user pick a folder and bulk-add every supported media file inside it (recursive)."""
     folder = filedialog.askdirectory(
@@ -651,9 +801,10 @@ def add_folder_to_multifile():
     if not folder:
         return
 
-    found_files = _collect_media_files_recursively(folder)
-
-    if not found_files:
+    # Single walk: _ingest_media_paths does the recursion itself, so decide
+    # "nothing found" from its counts instead of walking the tree twice.
+    added, duplicates, skipped_existing, _unsupported = _ingest_media_paths([folder])
+    if added + duplicates + skipped_existing == 0:
         messagebox.showinfo(
             localization.getstr('add_folder'),
             localization.getstr('add_folder_no_files').format(
@@ -661,24 +812,6 @@ def add_folder_to_multifile():
             ),
         )
         return
-
-    existing_paths = {os.path.normcase(os.path.abspath(p)) for p, _ in file_list}
-    added = 0
-    duplicates = 0
-    skipped_existing = 0
-    for file_path in found_files:
-        norm = os.path.normcase(os.path.abspath(file_path))
-        if norm in existing_paths:
-            duplicates += 1
-            continue
-        if _has_existing_subtitle(file_path):
-            skipped_existing += 1
-            continue
-        existing_paths.add(norm)
-        add_media_file_to_list(file_path)
-        added += 1
-
-    multifile_list_label['text'] = "0/" + str(len(file_list))
     append_runtime_log(
         f"Added {added} files from folder "
         f"(skipped: {duplicates} duplicate, {skipped_existing} already-subtitled): {folder}"
@@ -716,6 +849,15 @@ def should_use_fast_whisper():
     return fast_var.get() or selected_model in {"large-v3", "large-v3-turbo"}
 
 
+def _use_fast_path():
+    """True when transcription should go through the fast-whisper code path.
+
+    Qwen3-ASR is only implemented on the fast path, so selecting it must
+    route there regardless of the Fast checkbox / Whisper model choice —
+    otherwise a non-fast combo would silently run Whisper instead."""
+    return should_use_fast_whisper() or stt_engine_var.get() == "Qwen3-ASR"
+
+
 def proceedfastwhisperthread():
     from mywhisper import transcribe_from_mp3_fast_whisper, transcribe_from_mp3_whisper, release_retained_cuda_models
     from claudewrapper import ClaudeRateLimitError
@@ -743,12 +885,13 @@ def proceedfastwhisperthread():
         local_apikey=get_local_apikey_input(),
         cancel_event=_cancel_event,
         translate_filenames=translate_filenames_var.get(),
+        stt_engine=stt_engine_var.get(),
     )
     save_all_apikeys()
     settingjson(transferuiwrapper)
     append_runtime_log(f"Starting single file job: {targetfile}")
     try:
-        if should_use_fast_whisper():
+        if _use_fast_path():
             transcribe_from_mp3_fast_whisper(targetfile, targetfile_audio, transferuiwrapper)
         else:
             transcribe_from_mp3_whisper(targetfile, targetfile_audio, transferuiwrapper)
@@ -791,96 +934,200 @@ def proceedfastwhisperthread():
                 )
 
 # Worker subprocess emits progress events to stdout prefixed with this
-# sentinel. _run_worker_with_progress() peels them off and forwards them
+# sentinel. _PersistentWorker peels them off and forwards them
 # into multifile_queue so the UI updates live during long worker runs
 # (multifile + CUDA + fast whisper). Must match worker_subprocess.PROGRESS_SENTINEL.
 WORKER_PROGRESS_SENTINEL = "__J4S_PROG__"
+WORKER_DONE_SENTINEL = "__J4S_DONE__"  # per-job completion line in --serve mode
 
 
-def _run_worker_with_progress(args, cwd, queue_obj):
-    """Spawn worker_subprocess.py and stream its progress messages back into
-    `queue_obj` in real time. Returns a (returncode, stdout_str, stderr_str)
-    tuple after the worker exits — the same shape the caller used to get
-    from subprocess.run(capture_output=True), so the surrounding rate-limit
-    / failure handling didn't have to change.
+class _PersistentWorker:
+    """One long-lived worker_subprocess.py (--serve) per batch.
 
-    Lines on stdout that start with the worker's progress sentinel are
-    JSON-decoded and pushed onto the queue as (text, value) tuples for the
-    existing UI dispatcher to render. Anything else is captured verbatim
-    and returned in stdout_str so it still ends up in runtime.log.
+    Spawning a fresh Python per file cost 6-10 s each (torch import + model
+    reload + CUDA init) — 30-45 minutes of pure overhead on a 267-file batch.
+    This keeps ONE worker alive so torch stays imported and mywhisper's model
+    cache is reused across files. Progress lines are forwarded exactly as
+    before; a per-job DONE line carries the exit-style code (0 ok, 1 failed,
+    2 rate-limited), so the caller's retry / Fail logic is unchanged.
+
+    Robustness: if the worker dies mid-job the job is reported as failed and a
+    fresh worker is started for the next file; it is also recycled every
+    RESTART_EVERY jobs to bound any slow leak. Cancel terminates it, and the
+    job's temp audio is removed here because TerminateProcess skips the
+    worker's own finally-block cleanup.
     """
-    popen_kwargs = {
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "cwd": cwd,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-        "bufsize": 1,  # line-buffered on the parent side
-    }
-    if sys.platform == "win32":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    RESTART_EVERY = 50
 
-    proc = subprocess.Popen(args, **popen_kwargs)
+    def __init__(self):
+        self.proc = None
+        self._spec = None
+        self._jobs_done = 0
+        self._done_q = None
+        self._stdout_chunks = []
+        self._stderr_chunks = []
+        self._threads = []
 
-    stdout_chunks = []
-    stderr_chunks = []
+    @staticmethod
+    def _base_args(args):
+        # Strip the per-file --file/--temp-audio pairs; everything else is
+        # constant for the batch and identifies the process we can reuse.
+        out, skip = [], False
+        for a in args:
+            if skip:
+                skip = False
+                continue
+            if a in ("--file", "--temp-audio"):
+                skip = True
+                continue
+            out.append(a)
+        return out
 
-    def _drain_stdout():
+    def _start(self, base_args, cwd, env, queue_obj):
+        self.close()
+        popen_kwargs = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "cwd": cwd,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+        }
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        if env is not None:
+            popen_kwargs["env"] = env
+        self.proc = subprocess.Popen(list(base_args) + ["--serve"], **popen_kwargs)
+        self._spec = (tuple(base_args), cwd)
+        self._jobs_done = 0
+        self._done_q = queue.Queue()
+        proc, done_q = self.proc, self._done_q
+        t_out = threading.Thread(target=self._drain_stdout, args=(proc, done_q, queue_obj), daemon=True)
+        t_err = threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True)
+        t_out.start()
+        t_err.start()
+        self._threads = [t_out, t_err]
+        append_runtime_log("Persistent worker started")
+
+    def _alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def close(self):
+        proc = self.proc
+        if proc is None:
+            return
         try:
-            for line in proc.stdout:
-                if line.startswith(WORKER_PROGRESS_SENTINEL):
-                    try:
-                        payload = json.loads(line[len(WORKER_PROGRESS_SENTINEL):].strip())
-                        # payload = {"m": "text"|"bar", "l": <label>, "v": <value>}
-                        # Forward as (label, value) — the UI dispatcher in
-                        # multifile_update_from_queue already handles
-                        # "text"/"value"/"maximum" labels uniformly.
-                        queue_obj.put((payload.get("l"), payload.get("v")))
-                    except Exception:
-                        # Mangled progress line — fall back to logging.
-                        stdout_chunks.append(line)
-                else:
-                    stdout_chunks.append(line)
-        except Exception:
-            pass
-
-    def _drain_stderr():
-        try:
-            for line in proc.stderr:
-                stderr_chunks.append(line)
-        except Exception:
-            pass
-
-    def _cancel_watcher():
-        # Poll the global cancel event ~5 times per second while the worker
-        # is alive. When the user hits Cancel mid-job, terminate() lets the
-        # multifile + CUDA + fast-whisper path bail out within a second
-        # instead of waiting for the current file's Whisper transcription
-        # to complete (which can be many minutes for long audio).
-        import time as _time
-        while proc.poll() is None:
-            if _cancel_event.is_set():
+            if proc.poll() is None:
                 try:
-                    proc.terminate()
+                    proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+                    proc.stdin.flush()
                 except Exception:
                     pass
-                return
-            _time.sleep(0.2)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.terminate()
+        except Exception:
+            pass
+        for t in self._threads:
+            t.join(timeout=2)
+        self.proc = None
+        self._threads = []
+        append_runtime_log("Persistent worker stopped")
 
-    t_out = threading.Thread(target=_drain_stdout, daemon=True)
-    t_err = threading.Thread(target=_drain_stderr, daemon=True)
-    t_cancel = threading.Thread(target=_cancel_watcher, daemon=True)
-    t_out.start()
-    t_err.start()
-    t_cancel.start()
+    def _drain_stdout(self, proc, done_q, queue_obj):
+        try:
+            for line in proc.stdout:
+                if line.startswith(WORKER_DONE_SENTINEL):
+                    try:
+                        done_q.put(json.loads(line[len(WORKER_DONE_SENTINEL):].strip()))
+                    except Exception:
+                        done_q.put({"code": 1})
+                elif line.startswith(WORKER_PROGRESS_SENTINEL):
+                    try:
+                        payload = json.loads(line[len(WORKER_PROGRESS_SENTINEL):].strip())
+                        queue_obj.put((payload.get("l"), payload.get("v")))
+                    except Exception:
+                        self._stdout_chunks.append(line)
+                else:
+                    self._stdout_chunks.append(line)
+        except Exception:
+            pass
+        done_q.put({"eof": True})  # process gone: unblock any waiter
 
-    proc.wait()
-    t_out.join(timeout=2)
-    t_err.join(timeout=2)
-    # _cancel_watcher exits on its own once proc.poll() returns non-None.
+    def _drain_stderr(self, proc):
+        try:
+            for line in proc.stderr:
+                self._stderr_chunks.append(line)
+        except Exception:
+            pass
 
-    return proc.returncode, "".join(stdout_chunks), "".join(stderr_chunks)
+    @staticmethod
+    def _cleanup_temp(temp_audio):
+        # TerminateProcess skips the worker's finally cleanup; remove the
+        # (~115 MB per hour of audio) temp wav ourselves so cancels / crashes
+        # don't litter the media folders.
+        try:
+            if temp_audio and os.path.exists(temp_audio):
+                os.remove(temp_audio)
+                append_runtime_log(f"Removed temp audio after worker stop: {temp_audio}")
+        except Exception:
+            pass
+
+    def _send(self, file, temp_audio):
+        self.proc.stdin.write(json.dumps({"file": file, "temp_audio": temp_audio}, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+
+    def run_job(self, args, file, temp_audio, cwd, queue_obj, env=None):
+        """Run one file through the (reused) worker. Returns
+        (code, stdout_str, stderr_str) exactly like the old per-file spawn:
+        0 ok, 1 failed, 2 rate-limited."""
+        base_args = self._base_args(args)
+        if (not self._alive() or self._spec != (tuple(base_args), cwd)
+                or self._jobs_done >= self.RESTART_EVERY):
+            self._start(base_args, cwd, env, queue_obj)
+        self._stdout_chunks, self._stderr_chunks = [], []
+        try:
+            self._send(file, temp_audio)
+        except Exception as exc:
+            append_runtime_log(f"Persistent worker: could not send job ({type(exc).__name__}); restarting")
+            self._start(base_args, cwd, env, queue_obj)
+            try:
+                self._send(file, temp_audio)
+            except Exception:
+                return 1, "", "could not deliver job to worker"
+
+        done_q = self._done_q
+        while True:
+            try:
+                msg = done_q.get(timeout=0.2)
+                break
+            except queue.Empty:
+                if _cancel_event.is_set():
+                    try:
+                        self.proc.terminate()
+                    except Exception:
+                        pass
+                    self._cleanup_temp(temp_audio)
+                    self.proc = None
+                    return 1, "".join(self._stdout_chunks), "cancelled"
+                if not self._alive():
+                    rc = self.proc.returncode if self.proc else None
+                    self._cleanup_temp(temp_audio)
+                    self.proc = None
+                    return (rc if rc not in (None, 0) else 1), "".join(self._stdout_chunks), "".join(self._stderr_chunks)
+        if msg.get("eof"):
+            rc = self.proc.poll() if self.proc else None
+            self._cleanup_temp(temp_audio)
+            self.proc = None
+            return (rc if rc not in (None, 0) else 1), "".join(self._stdout_chunks), "".join(self._stderr_chunks)
+        self._jobs_done += 1
+        return int(msg.get("code", 1)), "".join(self._stdout_chunks), "".join(self._stderr_chunks)
+
+
+_persistent_worker = _PersistentWorker()
 
 
 def proceed_multifile_whisperthread():
@@ -908,9 +1155,14 @@ def proceed_multifile_whisperthread():
             local_system_prompt=get_local_system_prompt_input(),
             local_temperature=get_local_temperature_input(),
             local_apikey=get_local_apikey_input(),
+            stt_engine=stt_engine_var.get(),
         )
         save_all_apikeys()
         settingjson(transferuiwrapper)
+
+        # Fresh batch → clear last run's failures so stale "Fail" rows don't
+        # carry over into this run's status display.
+        multifile_failed_paths.clear()
 
         # If filename translation is enabled, batch-translate all Japanese
         # basenames up front in ONE engine call. 267 files of Claude
@@ -944,9 +1196,15 @@ def proceed_multifile_whisperthread():
             file_name_without_extension, _ = os.path.splitext(file)
             file_audio = file_name_without_extension + "_joy4sub_temp.wav"
             append_runtime_log(f"Prepared temp audio path for multifile item {i + 1}/{len(file_list)}: {file_audio}")
-            if should_use_fast_whisper() and cuda_var.get():
+            # Qwen3-ASR is deliberately kept OUT of the subprocess-per-file path:
+            # a fresh worker per file would reload the ~3.5GB Qwen model every
+            # time (30-60s x N files). Routing it through the in-process path
+            # below lets qwenasr's module-level cache load the model ONCE and
+            # reuse it for the whole batch. Whisper keeps the subprocess path
+            # (cheap reload, memory isolation per file).
+            if _use_fast_path() and cuda_var.get() and stt_engine_var.get() != "Qwen3-ASR":
                 append_runtime_log(f"Dispatching subprocess fast whisper for multifile item {i + 1}/{len(file_list)}")
-                multifile_queue.put(("text", f"Launching worker {i + 1}/{len(file_list)}"))
+                multifile_queue.put(("text", f"Processing {i + 1}/{len(file_list)}"))
                 worker_script = os.path.join(os.path.dirname(__file__), "worker_subprocess.py")
                 worker_args = [
                     sys.executable,
@@ -955,19 +1213,13 @@ def proceed_multifile_whisperthread():
                     "--temp-audio", file_audio,
                     "--model", translateoption_var.get(),
                     "--target-lang", targetlanguagecodeinput.get(),
-                    "--deepl-key", get_deepl_key_input(),
-                    "--gemini-keys", get_gemini_keys_input(),
-                    "--openai-keys", get_openai_keys_input(),
                     "--gemini-model", gemini_model_var.get(),
                     "--openai-model", openai_model_var.get(),
-                    "--claude-pro-token", get_claude_pro_token_input(),
-                    "--claude-team-token", get_claude_team_token_input(),
                     "--claude-default-plan", claude_default_plan_var.get(),
                     "--local-endpoint", get_local_endpoint_input(),
                     "--local-model", get_local_model_input(),
                     "--local-system-prompt", get_local_system_prompt_input(),
                     "--local-temperature", str(get_local_temperature_input()),
-                    "--local-apikey", get_local_apikey_input(),
                 ]
                 if sourcelanguagecodeinput.get():
                     worker_args.extend(["--source-lang", sourcelanguagecodeinput.get()])
@@ -978,19 +1230,34 @@ def proceed_multifile_whisperthread():
                 if cuda_var.get():
                     worker_args.append("--cuda")
                 worker_args.extend(["--engine", translation_engine_var.get()])
+                worker_args.extend(["--stt-engine", stt_engine_var.get()])
+
+                # Secrets go to the worker through its ENVIRONMENT, never argv:
+                # argv is readable by every process on the machine (Task
+                # Manager, WMI, process-creation audit logs, crash dumps).
+                worker_env = os.environ.copy()
+                worker_env.update({
+                    "JOY4SUB_DEEPL_KEY": get_deepl_key_input(),
+                    "JOY4SUB_GEMINI_KEYS": get_gemini_keys_input(),
+                    "JOY4SUB_OPENAI_KEYS": get_openai_keys_input(),
+                    "JOY4SUB_CLAUDE_PRO_TOKEN": get_claude_pro_token_input(),
+                    "JOY4SUB_CLAUDE_TEAM_TOKEN": get_claude_team_token_input(),
+                    "JOY4SUB_LOCAL_APIKEY": get_local_apikey_input(),
+                })
 
                 rate_limit_cancelled = False
                 while True:
-                    # _run_worker_with_progress streams the worker's progress
+                    # _persistent_worker.run_job streams the worker's progress
                     # events back into multifile_queue in real time, so the
                     # UI no longer freezes on the post-transcription text
                     # for the entire CUDA+fast-whisper run. Returns the same
                     # (returncode, stdout, stderr) shape the old subprocess.run
                     # did, with progress lines stripped from stdout.
-                    returncode, worker_stdout, worker_stderr = _run_worker_with_progress(
-                        worker_args,
+                    returncode, worker_stdout, worker_stderr = _persistent_worker.run_job(
+                        worker_args, file, file_audio,
                         cwd=os.path.dirname(__file__),
                         queue_obj=multifile_queue,
+                        env=worker_env,
                     )
                     append_runtime_log(f"Worker process exited with code {returncode} for {file}")
                     if worker_stdout.strip():
@@ -1010,28 +1277,51 @@ def proceed_multifile_whisperthread():
                             rate_limit_cancelled = True
                             break
                     elif returncode != 0:
-                        multifile_queue.put(("text", f"Worker failed: {os.path.basename(file)}"))
+                        # A single unreadable/corrupt file (e.g. non-RIFF .wav,
+                        # an mp3 ffmpeg can't parse) must NOT abort the whole
+                        # batch. Record it as failed, tell the user, and move on
+                        # to the next file so the remaining ones still process.
+                        multifile_failed_paths.add(file)
+                        append_runtime_log(f"Worker failed for {file}; marking Fail and continuing")
+                        multifile_queue.put(("text", f"Worker failed (skipping): {os.path.basename(file)}"))
                         break
                     else:
+                        # Exit 0 is not proof of success: translation may have
+                        # returned None and written no .srt.
+                        _mark_fail_if_no_srt(file)
                         break
                 if rate_limit_cancelled:
                     break
-            elif should_use_fast_whisper():
+            elif _use_fast_path():
                 append_runtime_log(f"Dispatching fast whisper for multifile item {i + 1}/{len(file_list)}")
                 try:
                     transcribe_from_mp3_fast_whisper(file, file_audio, transferuiwrapper)
+                    _mark_fail_if_no_srt(file)
                 except ClaudeRateLimitError:
                     append_runtime_log(f"Rate limit cancelled at multifile item {i + 1}/{len(file_list)}: {file}")
                     multifile_queue.put(("text", "작업 취소됨"))
                     break
+                except Exception as exc:
+                    # One unreadable/failed file must not abort the batch (matches
+                    # the subprocess path): mark Fail and move on to the next.
+                    multifile_failed_paths.add(file)
+                    append_runtime_log(f"In-process fast whisper failed for {file}: {type(exc).__name__}: {exc}; marking Fail and continuing")
+                    multifile_queue.put(("text", f"실패 (건너뜀): {os.path.basename(file)}"))
+                    continue
             else:
                 append_runtime_log(f"Dispatching stable whisper for multifile item {i + 1}/{len(file_list)}")
                 try:
                     transcribe_from_mp3_whisper(file, file_audio, transferuiwrapper)
+                    _mark_fail_if_no_srt(file)
                 except ClaudeRateLimitError:
                     append_runtime_log(f"Rate limit cancelled at multifile item {i + 1}/{len(file_list)}: {file}")
                     multifile_queue.put(("text", "작업 취소됨"))
                     break
+                except Exception as exc:
+                    multifile_failed_paths.add(file)
+                    append_runtime_log(f"In-process stable whisper failed for {file}: {type(exc).__name__}: {exc}; marking Fail and continuing")
+                    multifile_queue.put(("text", f"실패 (건너뜀): {os.path.basename(file)}"))
+                    continue
             append_runtime_log(f"Returned from worker for multifile item {i + 1}/{len(file_list)}: {file}")
             append_runtime_log(f"Finished multifile item {i + 1}/{len(file_list)}: {file}")
             # Rename media + all sibling subtitle/sidecar files to the
@@ -1045,7 +1335,18 @@ def proceed_multifile_whisperthread():
             new_basename = filename_rename_map.get(file)
             if new_basename:
                 if _find_sibling_subtitles(file):
-                    _rename_pair_for_file(file, new_basename)
+                    new_media_path = _rename_pair_for_file(file, new_basename)
+                    if new_media_path:
+                        # Keep file_list (this thread) and the treeview row
+                        # (main thread, via the queue) pointing at the NEW
+                        # path. Otherwise check_multifile_status keeps looking
+                        # for <old base>.srt, the row stays Undone forever, and
+                        # a re-run would try to open the old (gone) path.
+                        for idx, (p, _sp) in enumerate(file_list):
+                            if p == file:
+                                file_list[idx] = (new_media_path, new_media_path)
+                                break
+                        multifile_queue.put(("__file_renamed__", (file, new_media_path)))
                 else:
                     append_runtime_log(
                         f"Filename rename skipped (no subtitle siblings produced): {file}"
@@ -1056,6 +1357,7 @@ def proceed_multifile_whisperthread():
             # as the batch progresses. Emitted regardless of success/failure;
             # the disk check inside the refresher decides Done vs leave-alone.
             multifile_queue.put(("__file_done__", None))
+        _persistent_worker.close()
         release_retained_cuda_models()
         append_runtime_log("Released retained CUDA models after multifile batch")
     except Exception as exc:
@@ -1107,6 +1409,9 @@ def multifile_update_from_queue():
             # finally block after the for-loop has finished (or been
             # cancelled). Consumer exits here.
             finished = True
+        elif kind == "__file_renamed__":
+            old_path, new_path = val
+            _apply_row_rename(old_path, new_path)
         elif kind == "__file_done__":
             # One file just completed (success or failure). Defer the
             # treeview status refresh until after the drain so multiple
@@ -1239,6 +1544,7 @@ def initialize():
     original_var.set(settings.get("original", False))
     fast_var.set(settings.get("fast", True) or saved_model in {"large-v3", "large-v3-turbo"})
     translation_engine_var.set(settings.get("translation_engine", "DeepL"))
+    stt_engine_var.set(settings.get("stt_engine", "Whisper"))
     saved_gemini_model = settings.get("gemini_model", "")
     if saved_gemini_model:
         gemini_model_var.set(saved_gemini_model)
@@ -1269,7 +1575,7 @@ def request_cancel():
     the next checkpoint and shuts down — between files in the multifile
     loop, between batches in translate_subtitle_lines, between retries in
     the Local LLM / Claude wrappers. The subprocess worker is also killed
-    immediately by the cancel watcher inside _run_worker_with_progress.
+    immediately by the cancel poll inside _PersistentWorker.run_job.
 
     The button is disabled and switched to "취소 중..." while cancellation
     propagates; the Finished handler restores it to "자막생성" when the
@@ -1335,6 +1641,10 @@ def proceedmultifile():
 
     multi_processing = True
     _cancel_event.clear()
+    # Rows left on Fail from a previous run must be able to turn Done again
+    # (check_multifile_status skips Fail rows). We're on the Tk main thread
+    # here, so it's safe to touch the treeview directly.
+    _reset_fail_rows()
     # Same Generate -> Cancel toggle pattern as single-file mode.
     multifile_generation_button.config(text=localization.getstr('cancel'), command=request_cancel)
     proceedbutton.config(state=DISABLED)
@@ -1403,6 +1713,13 @@ modeldropdown = ttk.Combobox(frame2, textvariable=translateoption_var, values=tr
 modeldropdown.grid(column=0, row=0)
 checkbox = ttk.Checkbutton(frame2, text="Cuda", variable=cuda_var)
 checkbox.grid(column=1, row=0, padx=(10, 0))
+
+# Speech-to-text engine selector: Whisper (default) or Qwen3-ASR.
+Label(frame2, text=localization.getstr('stt_engine')).grid(column=0, row=1, sticky='w', pady=(6, 0))
+Radiobutton(frame2, text="Whisper", variable=stt_engine_var, value="Whisper"
+            ).grid(column=1, row=1, sticky='w', pady=(6, 0))
+Radiobutton(frame2, text="Qwen3-ASR", variable=stt_engine_var, value="Qwen3-ASR"
+            ).grid(column=2, row=1, sticky='w', pady=(6, 0))
 
 # Row 2 — source language code
 Label(form_frame, text=localization.getstr('sourcelangcode'), justify='left'
@@ -1653,12 +1970,19 @@ file_treeview_instruction = Label(
 )
 file_treeview_instruction.grid(column=0, row=0, sticky='w')
 
+add_file_button = Button(
+    multifile_header_frame,
+    text=localization.getstr('add_file'),
+    command=add_files_to_multifile,
+)
+add_file_button.grid(column=1, row=0, padx=(8, 4), sticky='e')
+
 add_folder_button = Button(
     multifile_header_frame,
     text=localization.getstr('add_folder'),
     command=add_folder_to_multifile,
 )
-add_folder_button.grid(column=1, row=0, padx=(8, 4), sticky='e')
+add_folder_button.grid(column=2, row=0, padx=(0, 4), sticky='e')
 
 file_treeview = ttk.Treeview(
     tree_frame,
@@ -1675,19 +1999,30 @@ file_treeview.heading(localization.getstr("length"), text=localization.getstr("l
 file_treeview.heading(localization.getstr("status"), text=localization.getstr("status"))
 
 file_treeview.column("#0", width=0, stretch=tkinter.NO)
-# Path column absorbs extra width when the window is wider than the default;
-# the small fixed-width columns (size / length / status) stay readable.
-file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=620, stretch=tkinter.YES)
+# Path column shows the FULL path (no abbreviation) and is wide by default;
+# it still absorbs extra width when the window is wider. Very long paths can
+# be read end-to-end by dragging the column wider and/or using the horizontal
+# scrollbar below. The small fixed-width columns stay readable.
+# Fixed width (stretch=NO) is REQUIRED for the horizontal scrollbar to work:
+# with stretch the column shrinks to fit the viewport, so content never
+# overflows and the scrollbar has no thumb. _autosize_path_column() grows this
+# to fit the longest queued path so the scrollbar can pan across the full path.
+file_treeview.column(localization.getstr("path"), anchor=tkinter.W, width=900, minwidth=200, stretch=tkinter.NO)
 file_treeview.column(localization.getstr("size"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
 file_treeview.column(localization.getstr("length"), anchor=tkinter.W, width=100, stretch=tkinter.NO)
 file_treeview.column(localization.getstr("status"), anchor=tkinter.W, width=80, stretch=tkinter.NO)
+
+# Horizontal scrollbar so full (long) file paths can be read end-to-end.
+file_treeview_xscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=file_treeview.xview)
+file_treeview.configure(xscrollcommand=file_treeview_xscroll.set)
+file_treeview_xscroll.grid(column=0, row=2, sticky='ew')
 
 
 
 # Bottom strip: progress bar, generate button, status indicators.
 # Sits below the treeview, full-width so the contents can be centered.
 generationframe = Frame(tree_frame)
-generationframe.grid(column=0, row=2, sticky='ew', pady=(8, 4))
+generationframe.grid(column=0, row=3, sticky='ew', pady=(8, 4))
 generationframe.grid_columnconfigure(0, weight=1)
 generationframe.grid_columnconfigure(2, weight=1)  # right side flex for visual balance
 

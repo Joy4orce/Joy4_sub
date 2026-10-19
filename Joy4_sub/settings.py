@@ -212,15 +212,42 @@ def settingjson(uiwrapper):
         "local_model": getattr(uiwrapper, 'local_model', '') or '',
         "local_system_prompt": getattr(uiwrapper, 'local_system_prompt', '') or '',
         "local_temperature": getattr(uiwrapper, 'local_temperature', 0.1),
+        "stt_engine": getattr(uiwrapper, 'stt_engine', 'Whisper') or 'Whisper',
     }
-    with open(get_settings_path(), "w", encoding="utf-8") as f:
-        json.dump(settings, f)
+    # Atomic save: write to a sibling temp file, then os.replace() it over the
+    # real one. A crash / power loss mid-write used to leave a 0-byte or
+    # half-written settings.json that made the app unable to start.
+    final_path = get_settings_path()
+    tmp_path = final_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp_path, final_path)
 
 
 def load_settings():
+    """Return the saved settings dict, or {} if there is no usable file.
+
+    Any failure (missing file, truncated/corrupt JSON, wrong type, unreadable)
+    falls back to defaults instead of crashing initialize() at import time —
+    the user must never have to hand-delete settings.json to launch the app.
+    """
+    path = get_settings_path()
     try:
-        with open(get_settings_path(), "r", encoding="utf-8-sig") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             settings = json.load(f)
-            return settings
     except FileNotFoundError:
         return {}
+    except Exception as exc:
+        # Keep the broken file around for inspection, out of the way.
+        try:
+            os.replace(path, path + ".corrupt")
+        except OSError:
+            pass
+        print(f"[Joy4_sub] settings.json unreadable ({type(exc).__name__}); using defaults")
+        return {}
+    return settings if isinstance(settings, dict) else {}

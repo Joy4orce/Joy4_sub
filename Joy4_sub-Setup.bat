@@ -60,7 +60,7 @@ if errorlevel 1 goto :fail
 
 echo.
 echo [Joy4_sub] Installing packages...
-"%VPYTHON%" -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 -r "%REQ%"
+"%VPYTHON%" -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 -r "%REQ%"
 if errorlevel 1 goto :fail
 
 echo.
