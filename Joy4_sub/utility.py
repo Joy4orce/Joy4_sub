@@ -201,17 +201,3 @@ def sort_by_path(treeview, col, reverse):
 
     treeview.heading(col, command=lambda: treeview_sort_column(treeview, col, not reverse))
 
-def shorten_path(path, max_length=50):
-    if len(path) <= max_length:
-        return path
-
-    parts = path.split('/')
-    head = parts[0]
-    tail = parts[-1]
-
-    remaining_length = max_length - len(head) - len(tail) - 6  # 6 accounts for slashes and ellipsis
-
-    if remaining_length < 0:  # In case the max_length is too short
-        return f"{head[:2]}.../{tail[-(max_length - 6):]}"
-
-    return f"{head}/.../{tail}"

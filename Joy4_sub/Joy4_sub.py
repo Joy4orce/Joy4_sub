@@ -13,14 +13,11 @@ import json
 import os
 import re
 import subprocess
-import tqdm
 import traceback
 from datetime import datetime
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-import whisper
-import stable_whisper
 
 import UIwrapper
 import localization
@@ -523,15 +520,55 @@ def _autosize_path_column():
     file_treeview.column(localization.getstr("path"), width=target)
 
 
+from concurrent.futures import ThreadPoolExecutor
+
+# Media-length probes (an `ffmpeg -i` per file, ~50 ms warm / ~0.5 s cold) run
+# OFF the Tk thread. Adding a 500-file folder used to block the UI for 25-30 s
+# ("not responding"); now rows appear instantly with a placeholder and the
+# length column fills in as probes complete. 8 workers ~ 8x faster overall.
+_probe_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="media-probe")
+
+
+# Probe results cross back to the Tk thread through a queue drained by a
+# periodic after() loop. (Calling window.after() directly from a worker
+# thread is not thread-safe in Tkinter and is silently dropped.)
+_probe_results = queue.Queue()
+
+
+def _apply_probed_length(iid, length_text):
+    """Tk main thread only. The row may have been deleted before the probe
+    finished."""
+    if not file_treeview.exists(iid):
+        return
+    values = list(file_treeview.item(iid, 'values'))
+    if len(values) >= 3:
+        values[2] = length_text
+        file_treeview.item(iid, values=tuple(values))
+
+
+def _drain_probe_results():
+    try:
+        while True:
+            iid, length_text = _probe_results.get_nowait()
+            _apply_probed_length(iid, length_text)
+    except queue.Empty:
+        pass
+    window.after(150, _drain_probe_results)
+
+
+window.after(150, _drain_probe_results)
+
+
 def add_media_file_to_list(file_path):
+    iid = str(uuid.uuid4())
     file_treeview.insert(
         parent='',
         index=tkinter.END,
-        iid=uuid.uuid4(),
+        iid=iid,
         values=[
             file_path,
             str(get_file_size_in_mb(file_path)) + "MB",
-            get_media_length_in_time(file_path),
+            "...",  # length is filled in asynchronously by the probe below
             "Undone",
         ],
     )
@@ -540,30 +577,14 @@ def add_media_file_to_list(file_path):
     # is shown. Now that we show the full path, store the full path here too.
     file_list.append((file_path, file_path))
 
-def get_active_progress_queue():
-    return multifile_queue if multi_processing else update_queue
+    def _probe():
+        try:
+            length = get_media_length_in_time(file_path)
+        except Exception:
+            length = "Unknown"
+        _probe_results.put((iid, length))
+    _probe_executor.submit(_probe)
 
-class _CustomProgressBar(tqdm.tqdm):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._current = self.n  # Set the initial value
-
-    def update(self, n):
-        super().update(n)
-        self._current += n
-        active_queue = get_active_progress_queue()
-        percentage = "{:.2f}".format(round((self._current / self.total) * 100, 2)) + "%"
-        with lock:
-            active_queue.put(("maximum", self.total))
-            active_queue.put(("value", self._current))
-            active_queue.put(("text", percentage))
-
-
-transcribe_module = sys.modules['whisper.transcribe']
-transcribe_module.tqdm.tqdm = _CustomProgressBar
-
-#stable_transcribe_module = sys.modules['stable_whisper.whisper_word_level']
-#stable_transcribe_module.tqdm = _CustomProgressBar
 
 
 
@@ -768,7 +789,10 @@ def add_folder_to_multifile():
     if not folder:
         return
 
-    if not _collect_media_files_recursively(folder):
+    # Single walk: _ingest_media_paths does the recursion itself, so decide
+    # "nothing found" from its counts instead of walking the tree twice.
+    added, duplicates, skipped_existing, _unsupported = _ingest_media_paths([folder])
+    if added + duplicates + skipped_existing == 0:
         messagebox.showinfo(
             localization.getstr('add_folder'),
             localization.getstr('add_folder_no_files').format(
@@ -776,8 +800,6 @@ def add_folder_to_multifile():
             ),
         )
         return
-
-    added, duplicates, skipped_existing, _unsupported = _ingest_media_paths([folder])
     append_runtime_log(
         f"Added {added} files from folder "
         f"(skipped: {duplicates} duplicate, {skipped_existing} already-subtitled): {folder}"
@@ -900,98 +922,200 @@ def proceedfastwhisperthread():
                 )
 
 # Worker subprocess emits progress events to stdout prefixed with this
-# sentinel. _run_worker_with_progress() peels them off and forwards them
+# sentinel. _PersistentWorker peels them off and forwards them
 # into multifile_queue so the UI updates live during long worker runs
 # (multifile + CUDA + fast whisper). Must match worker_subprocess.PROGRESS_SENTINEL.
 WORKER_PROGRESS_SENTINEL = "__J4S_PROG__"
+WORKER_DONE_SENTINEL = "__J4S_DONE__"  # per-job completion line in --serve mode
 
 
-def _run_worker_with_progress(args, cwd, queue_obj, env=None):
-    """Spawn worker_subprocess.py and stream its progress messages back into
-    `queue_obj` in real time. Returns a (returncode, stdout_str, stderr_str)
-    tuple after the worker exits — the same shape the caller used to get
-    from subprocess.run(capture_output=True), so the surrounding rate-limit
-    / failure handling didn't have to change.
+class _PersistentWorker:
+    """One long-lived worker_subprocess.py (--serve) per batch.
 
-    Lines on stdout that start with the worker's progress sentinel are
-    JSON-decoded and pushed onto the queue as (text, value) tuples for the
-    existing UI dispatcher to render. Anything else is captured verbatim
-    and returned in stdout_str so it still ends up in runtime.log.
+    Spawning a fresh Python per file cost 6-10 s each (torch import + model
+    reload + CUDA init) — 30-45 minutes of pure overhead on a 267-file batch.
+    This keeps ONE worker alive so torch stays imported and mywhisper's model
+    cache is reused across files. Progress lines are forwarded exactly as
+    before; a per-job DONE line carries the exit-style code (0 ok, 1 failed,
+    2 rate-limited), so the caller's retry / Fail logic is unchanged.
+
+    Robustness: if the worker dies mid-job the job is reported as failed and a
+    fresh worker is started for the next file; it is also recycled every
+    RESTART_EVERY jobs to bound any slow leak. Cancel terminates it, and the
+    job's temp audio is removed here because TerminateProcess skips the
+    worker's own finally-block cleanup.
     """
-    popen_kwargs = {
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "cwd": cwd,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-        "bufsize": 1,  # line-buffered on the parent side
-    }
-    if sys.platform == "win32":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-    if env is not None:
-        popen_kwargs["env"] = env
+    RESTART_EVERY = 50
 
-    proc = subprocess.Popen(args, **popen_kwargs)
+    def __init__(self):
+        self.proc = None
+        self._spec = None
+        self._jobs_done = 0
+        self._done_q = None
+        self._stdout_chunks = []
+        self._stderr_chunks = []
+        self._threads = []
 
-    stdout_chunks = []
-    stderr_chunks = []
+    @staticmethod
+    def _base_args(args):
+        # Strip the per-file --file/--temp-audio pairs; everything else is
+        # constant for the batch and identifies the process we can reuse.
+        out, skip = [], False
+        for a in args:
+            if skip:
+                skip = False
+                continue
+            if a in ("--file", "--temp-audio"):
+                skip = True
+                continue
+            out.append(a)
+        return out
 
-    def _drain_stdout():
+    def _start(self, base_args, cwd, env, queue_obj):
+        self.close()
+        popen_kwargs = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "cwd": cwd,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+        }
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        if env is not None:
+            popen_kwargs["env"] = env
+        self.proc = subprocess.Popen(list(base_args) + ["--serve"], **popen_kwargs)
+        self._spec = (tuple(base_args), cwd)
+        self._jobs_done = 0
+        self._done_q = queue.Queue()
+        proc, done_q = self.proc, self._done_q
+        t_out = threading.Thread(target=self._drain_stdout, args=(proc, done_q, queue_obj), daemon=True)
+        t_err = threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True)
+        t_out.start()
+        t_err.start()
+        self._threads = [t_out, t_err]
+        append_runtime_log("Persistent worker started")
+
+    def _alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def close(self):
+        proc = self.proc
+        if proc is None:
+            return
         try:
-            for line in proc.stdout:
-                if line.startswith(WORKER_PROGRESS_SENTINEL):
-                    try:
-                        payload = json.loads(line[len(WORKER_PROGRESS_SENTINEL):].strip())
-                        # payload = {"m": "text"|"bar", "l": <label>, "v": <value>}
-                        # Forward as (label, value) — the UI dispatcher in
-                        # multifile_update_from_queue already handles
-                        # "text"/"value"/"maximum" labels uniformly.
-                        queue_obj.put((payload.get("l"), payload.get("v")))
-                    except Exception:
-                        # Mangled progress line — fall back to logging.
-                        stdout_chunks.append(line)
-                else:
-                    stdout_chunks.append(line)
-        except Exception:
-            pass
-
-    def _drain_stderr():
-        try:
-            for line in proc.stderr:
-                stderr_chunks.append(line)
-        except Exception:
-            pass
-
-    def _cancel_watcher():
-        # Poll the global cancel event ~5 times per second while the worker
-        # is alive. When the user hits Cancel mid-job, terminate() lets the
-        # multifile + CUDA + fast-whisper path bail out within a second
-        # instead of waiting for the current file's Whisper transcription
-        # to complete (which can be many minutes for long audio).
-        import time as _time
-        while proc.poll() is None:
-            if _cancel_event.is_set():
+            if proc.poll() is None:
                 try:
-                    proc.terminate()
+                    proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+                    proc.stdin.flush()
                 except Exception:
                     pass
-                return
-            _time.sleep(0.2)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.terminate()
+        except Exception:
+            pass
+        for t in self._threads:
+            t.join(timeout=2)
+        self.proc = None
+        self._threads = []
+        append_runtime_log("Persistent worker stopped")
 
-    t_out = threading.Thread(target=_drain_stdout, daemon=True)
-    t_err = threading.Thread(target=_drain_stderr, daemon=True)
-    t_cancel = threading.Thread(target=_cancel_watcher, daemon=True)
-    t_out.start()
-    t_err.start()
-    t_cancel.start()
+    def _drain_stdout(self, proc, done_q, queue_obj):
+        try:
+            for line in proc.stdout:
+                if line.startswith(WORKER_DONE_SENTINEL):
+                    try:
+                        done_q.put(json.loads(line[len(WORKER_DONE_SENTINEL):].strip()))
+                    except Exception:
+                        done_q.put({"code": 1})
+                elif line.startswith(WORKER_PROGRESS_SENTINEL):
+                    try:
+                        payload = json.loads(line[len(WORKER_PROGRESS_SENTINEL):].strip())
+                        queue_obj.put((payload.get("l"), payload.get("v")))
+                    except Exception:
+                        self._stdout_chunks.append(line)
+                else:
+                    self._stdout_chunks.append(line)
+        except Exception:
+            pass
+        done_q.put({"eof": True})  # process gone: unblock any waiter
 
-    proc.wait()
-    t_out.join(timeout=2)
-    t_err.join(timeout=2)
-    # _cancel_watcher exits on its own once proc.poll() returns non-None.
+    def _drain_stderr(self, proc):
+        try:
+            for line in proc.stderr:
+                self._stderr_chunks.append(line)
+        except Exception:
+            pass
 
-    return proc.returncode, "".join(stdout_chunks), "".join(stderr_chunks)
+    @staticmethod
+    def _cleanup_temp(temp_audio):
+        # TerminateProcess skips the worker's finally cleanup; remove the
+        # (~115 MB per hour of audio) temp wav ourselves so cancels / crashes
+        # don't litter the media folders.
+        try:
+            if temp_audio and os.path.exists(temp_audio):
+                os.remove(temp_audio)
+                append_runtime_log(f"Removed temp audio after worker stop: {temp_audio}")
+        except Exception:
+            pass
+
+    def _send(self, file, temp_audio):
+        self.proc.stdin.write(json.dumps({"file": file, "temp_audio": temp_audio}, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+
+    def run_job(self, args, file, temp_audio, cwd, queue_obj, env=None):
+        """Run one file through the (reused) worker. Returns
+        (code, stdout_str, stderr_str) exactly like the old per-file spawn:
+        0 ok, 1 failed, 2 rate-limited."""
+        base_args = self._base_args(args)
+        if (not self._alive() or self._spec != (tuple(base_args), cwd)
+                or self._jobs_done >= self.RESTART_EVERY):
+            self._start(base_args, cwd, env, queue_obj)
+        self._stdout_chunks, self._stderr_chunks = [], []
+        try:
+            self._send(file, temp_audio)
+        except Exception as exc:
+            append_runtime_log(f"Persistent worker: could not send job ({type(exc).__name__}); restarting")
+            self._start(base_args, cwd, env, queue_obj)
+            try:
+                self._send(file, temp_audio)
+            except Exception:
+                return 1, "", "could not deliver job to worker"
+
+        done_q = self._done_q
+        while True:
+            try:
+                msg = done_q.get(timeout=0.2)
+                break
+            except queue.Empty:
+                if _cancel_event.is_set():
+                    try:
+                        self.proc.terminate()
+                    except Exception:
+                        pass
+                    self._cleanup_temp(temp_audio)
+                    self.proc = None
+                    return 1, "".join(self._stdout_chunks), "cancelled"
+                if not self._alive():
+                    rc = self.proc.returncode if self.proc else None
+                    self._cleanup_temp(temp_audio)
+                    self.proc = None
+                    return (rc if rc not in (None, 0) else 1), "".join(self._stdout_chunks), "".join(self._stderr_chunks)
+        if msg.get("eof"):
+            rc = self.proc.poll() if self.proc else None
+            self._cleanup_temp(temp_audio)
+            self.proc = None
+            return (rc if rc not in (None, 0) else 1), "".join(self._stdout_chunks), "".join(self._stderr_chunks)
+        self._jobs_done += 1
+        return int(msg.get("code", 1)), "".join(self._stdout_chunks), "".join(self._stderr_chunks)
+
+
+_persistent_worker = _PersistentWorker()
 
 
 def proceed_multifile_whisperthread():
@@ -1068,7 +1192,7 @@ def proceed_multifile_whisperthread():
             # (cheap reload, memory isolation per file).
             if _use_fast_path() and cuda_var.get() and stt_engine_var.get() != "Qwen3-ASR":
                 append_runtime_log(f"Dispatching subprocess fast whisper for multifile item {i + 1}/{len(file_list)}")
-                multifile_queue.put(("text", f"Launching worker {i + 1}/{len(file_list)}"))
+                multifile_queue.put(("text", f"Processing {i + 1}/{len(file_list)}"))
                 worker_script = os.path.join(os.path.dirname(__file__), "worker_subprocess.py")
                 worker_args = [
                     sys.executable,
@@ -1111,14 +1235,14 @@ def proceed_multifile_whisperthread():
 
                 rate_limit_cancelled = False
                 while True:
-                    # _run_worker_with_progress streams the worker's progress
+                    # _persistent_worker.run_job streams the worker's progress
                     # events back into multifile_queue in real time, so the
                     # UI no longer freezes on the post-transcription text
                     # for the entire CUDA+fast-whisper run. Returns the same
                     # (returncode, stdout, stderr) shape the old subprocess.run
                     # did, with progress lines stripped from stdout.
-                    returncode, worker_stdout, worker_stderr = _run_worker_with_progress(
-                        worker_args,
+                    returncode, worker_stdout, worker_stderr = _persistent_worker.run_job(
+                        worker_args, file, file_audio,
                         cwd=os.path.dirname(__file__),
                         queue_obj=multifile_queue,
                         env=worker_env,
@@ -1210,6 +1334,7 @@ def proceed_multifile_whisperthread():
             # as the batch progresses. Emitted regardless of success/failure;
             # the disk check inside the refresher decides Done vs leave-alone.
             multifile_queue.put(("__file_done__", None))
+        _persistent_worker.close()
         release_retained_cuda_models()
         append_runtime_log("Released retained CUDA models after multifile batch")
     except Exception as exc:
@@ -1424,7 +1549,7 @@ def request_cancel():
     the next checkpoint and shuts down — between files in the multifile
     loop, between batches in translate_subtitle_lines, between retries in
     the Local LLM / Claude wrappers. The subprocess worker is also killed
-    immediately by the cancel watcher inside _run_worker_with_progress.
+    immediately by the cancel poll inside _PersistentWorker.run_job.
 
     The button is disabled and switched to "취소 중..." while cancellation
     propagates; the Finished handler restores it to "자막생성" when the

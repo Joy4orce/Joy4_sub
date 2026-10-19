@@ -15,6 +15,12 @@ def append_runtime_log(message):
         log_file.write(f"[{timestamp}] {message}\n")
 
 
+# DeepL rejects requests carrying more than 50 texts (400 Bad Request). The
+# caller's batches are byte-bounded (20KB) and can hold hundreds of short
+# subtitle lines, which made every file longer than ~50 lines fail outright.
+DEEPL_MAX_TEXTS_PER_REQUEST = 50
+
+
 def translateusingapi(text, uiwrapper):
     try:
         target_lang = uiwrapper.get_trglanguagecodeinput().strip()
@@ -34,11 +40,19 @@ def translateusingapi(text, uiwrapper):
             return None
 
         translator = Translator(api_key)
-        result = translator.translate_text(text, target_lang=target_lang)
 
         if isinstance(text, list):
-            append_runtime_log(f"DeepL translated batch of {len(text)} lines")
-            return [item.text for item in result]
+            out = []
+            step = DEEPL_MAX_TEXTS_PER_REQUEST
+            for start in range(0, len(text), step):
+                chunk = text[start:start + step]
+                result = translator.translate_text(chunk, target_lang=target_lang)
+                out.extend(item.text for item in result)
+            requests = -(-len(text) // step)
+            append_runtime_log(f"DeepL translated batch of {len(text)} lines in {requests} request(s)")
+            return out
+
+        result = translator.translate_text(text, target_lang=target_lang)
 
         append_runtime_log("DeepL translated single text payload")
         return result.text
