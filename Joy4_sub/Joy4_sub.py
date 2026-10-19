@@ -607,6 +607,31 @@ def check_multifile_status():
             item_value[3] = "Fail"
             file_treeview.item(item, values=tuple(item_value))
 
+def _mark_fail_if_no_srt(file):
+    """A worker/in-process run that finished without raising can still have
+    produced no translated subtitle (missing API key, parse failure, Local LLM
+    down, DeepL quota, ...). Treat "no .srt next to the media" as a failure so
+    the row shows Fail instead of sitting on Undone while the batch says
+    Finished. Called right after each file completes, BEFORE any rename."""
+    expected = os.path.splitext(file)[0] + ".srt"
+    if not os.path.exists(expected):
+        multifile_failed_paths.add(file)
+        append_runtime_log(f"No subtitle produced for {file}; marking Fail")
+        multifile_queue.put(("text", f"번역 실패 (건너뜀): {os.path.basename(file)}"))
+        return True
+    return False
+
+
+def _reset_fail_rows():
+    """Reset rows left on 'Fail' from a previous run back to 'Undone' so a
+    re-run can mark them Done again. Must run on the Tk main thread."""
+    for item in file_treeview.get_children():
+        item_value = list(file_treeview.item(item, 'values'))
+        if len(item_value) >= 4 and item_value[3] == "Fail":
+            item_value[3] = "Undone"
+            file_treeview.item(item, values=tuple(item_value))
+
+
 def list_label_indicate( number = 0):
     multifile_queue.put(('list', str(number) + "/" + str(len(file_list))))
 
@@ -790,6 +815,15 @@ def should_use_fast_whisper():
     return fast_var.get() or selected_model in {"large-v3", "large-v3-turbo"}
 
 
+def _use_fast_path():
+    """True when transcription should go through the fast-whisper code path.
+
+    Qwen3-ASR is only implemented on the fast path, so selecting it must
+    route there regardless of the Fast checkbox / Whisper model choice —
+    otherwise a non-fast combo would silently run Whisper instead."""
+    return should_use_fast_whisper() or stt_engine_var.get() == "Qwen3-ASR"
+
+
 def proceedfastwhisperthread():
     from mywhisper import transcribe_from_mp3_fast_whisper, transcribe_from_mp3_whisper, release_retained_cuda_models
     from claudewrapper import ClaudeRateLimitError
@@ -823,7 +857,7 @@ def proceedfastwhisperthread():
     settingjson(transferuiwrapper)
     append_runtime_log(f"Starting single file job: {targetfile}")
     try:
-        if should_use_fast_whisper():
+        if _use_fast_path():
             transcribe_from_mp3_fast_whisper(targetfile, targetfile_audio, transferuiwrapper)
         else:
             transcribe_from_mp3_whisper(targetfile, targetfile_audio, transferuiwrapper)
@@ -872,7 +906,7 @@ def proceedfastwhisperthread():
 WORKER_PROGRESS_SENTINEL = "__J4S_PROG__"
 
 
-def _run_worker_with_progress(args, cwd, queue_obj):
+def _run_worker_with_progress(args, cwd, queue_obj, env=None):
     """Spawn worker_subprocess.py and stream its progress messages back into
     `queue_obj` in real time. Returns a (returncode, stdout_str, stderr_str)
     tuple after the worker exits — the same shape the caller used to get
@@ -895,6 +929,8 @@ def _run_worker_with_progress(args, cwd, queue_obj):
     }
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    if env is not None:
+        popen_kwargs["env"] = env
 
     proc = subprocess.Popen(args, **popen_kwargs)
 
@@ -1030,7 +1066,7 @@ def proceed_multifile_whisperthread():
             # below lets qwenasr's module-level cache load the model ONCE and
             # reuse it for the whole batch. Whisper keeps the subprocess path
             # (cheap reload, memory isolation per file).
-            if should_use_fast_whisper() and cuda_var.get() and stt_engine_var.get() != "Qwen3-ASR":
+            if _use_fast_path() and cuda_var.get() and stt_engine_var.get() != "Qwen3-ASR":
                 append_runtime_log(f"Dispatching subprocess fast whisper for multifile item {i + 1}/{len(file_list)}")
                 multifile_queue.put(("text", f"Launching worker {i + 1}/{len(file_list)}"))
                 worker_script = os.path.join(os.path.dirname(__file__), "worker_subprocess.py")
@@ -1041,19 +1077,13 @@ def proceed_multifile_whisperthread():
                     "--temp-audio", file_audio,
                     "--model", translateoption_var.get(),
                     "--target-lang", targetlanguagecodeinput.get(),
-                    "--deepl-key", get_deepl_key_input(),
-                    "--gemini-keys", get_gemini_keys_input(),
-                    "--openai-keys", get_openai_keys_input(),
                     "--gemini-model", gemini_model_var.get(),
                     "--openai-model", openai_model_var.get(),
-                    "--claude-pro-token", get_claude_pro_token_input(),
-                    "--claude-team-token", get_claude_team_token_input(),
                     "--claude-default-plan", claude_default_plan_var.get(),
                     "--local-endpoint", get_local_endpoint_input(),
                     "--local-model", get_local_model_input(),
                     "--local-system-prompt", get_local_system_prompt_input(),
                     "--local-temperature", str(get_local_temperature_input()),
-                    "--local-apikey", get_local_apikey_input(),
                 ]
                 if sourcelanguagecodeinput.get():
                     worker_args.extend(["--source-lang", sourcelanguagecodeinput.get()])
@@ -1065,6 +1095,19 @@ def proceed_multifile_whisperthread():
                     worker_args.append("--cuda")
                 worker_args.extend(["--engine", translation_engine_var.get()])
                 worker_args.extend(["--stt-engine", stt_engine_var.get()])
+
+                # Secrets go to the worker through its ENVIRONMENT, never argv:
+                # argv is readable by every process on the machine (Task
+                # Manager, WMI, process-creation audit logs, crash dumps).
+                worker_env = os.environ.copy()
+                worker_env.update({
+                    "JOY4SUB_DEEPL_KEY": get_deepl_key_input(),
+                    "JOY4SUB_GEMINI_KEYS": get_gemini_keys_input(),
+                    "JOY4SUB_OPENAI_KEYS": get_openai_keys_input(),
+                    "JOY4SUB_CLAUDE_PRO_TOKEN": get_claude_pro_token_input(),
+                    "JOY4SUB_CLAUDE_TEAM_TOKEN": get_claude_team_token_input(),
+                    "JOY4SUB_LOCAL_APIKEY": get_local_apikey_input(),
+                })
 
                 rate_limit_cancelled = False
                 while True:
@@ -1078,6 +1121,7 @@ def proceed_multifile_whisperthread():
                         worker_args,
                         cwd=os.path.dirname(__file__),
                         queue_obj=multifile_queue,
+                        env=worker_env,
                     )
                     append_runtime_log(f"Worker process exited with code {returncode} for {file}")
                     if worker_stdout.strip():
@@ -1106,13 +1150,17 @@ def proceed_multifile_whisperthread():
                         multifile_queue.put(("text", f"Worker failed (skipping): {os.path.basename(file)}"))
                         break
                     else:
+                        # Exit 0 is not proof of success: translation may have
+                        # returned None and written no .srt.
+                        _mark_fail_if_no_srt(file)
                         break
                 if rate_limit_cancelled:
                     break
-            elif should_use_fast_whisper():
+            elif _use_fast_path():
                 append_runtime_log(f"Dispatching fast whisper for multifile item {i + 1}/{len(file_list)}")
                 try:
                     transcribe_from_mp3_fast_whisper(file, file_audio, transferuiwrapper)
+                    _mark_fail_if_no_srt(file)
                 except ClaudeRateLimitError:
                     append_runtime_log(f"Rate limit cancelled at multifile item {i + 1}/{len(file_list)}: {file}")
                     multifile_queue.put(("text", "작업 취소됨"))
@@ -1128,6 +1176,7 @@ def proceed_multifile_whisperthread():
                 append_runtime_log(f"Dispatching stable whisper for multifile item {i + 1}/{len(file_list)}")
                 try:
                     transcribe_from_mp3_whisper(file, file_audio, transferuiwrapper)
+                    _mark_fail_if_no_srt(file)
                 except ClaudeRateLimitError:
                     append_runtime_log(f"Rate limit cancelled at multifile item {i + 1}/{len(file_list)}: {file}")
                     multifile_queue.put(("text", "작업 취소됨"))
@@ -1441,6 +1490,10 @@ def proceedmultifile():
 
     multi_processing = True
     _cancel_event.clear()
+    # Rows left on Fail from a previous run must be able to turn Done again
+    # (check_multifile_status skips Fail rows). We're on the Tk main thread
+    # here, so it's safe to touch the treeview directly.
+    _reset_fail_rows()
     # Same Generate -> Cancel toggle pattern as single-file mode.
     multifile_generation_button.config(text=localization.getstr('cancel'), command=request_cancel)
     proceedbutton.config(state=DISABLED)

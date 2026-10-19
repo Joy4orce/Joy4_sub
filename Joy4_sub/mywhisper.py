@@ -80,6 +80,13 @@ def should_skip_immediate_gpu_cleanup(uiwrapper):
 def release_retained_cuda_models():
     global retained_cuda_models
     retained_cuda_models.clear()
+    # Also drop the cached Qwen3-ASR model (if it was used) so its VRAM is
+    # returned at batch end rather than staying resident for the process.
+    try:
+        import qwenasr
+        qwenasr.unload()
+    except Exception:
+        pass
     clear_gpu_memory()
 
 
@@ -302,6 +309,11 @@ def _fw_transcribe(model, file, uiwrapper, use_gpu):
     if USE_BATCHED_TRANSCRIPTION and use_gpu:
         try:
             pipeline = BatchedInferencePipeline(model=model)
+            append_runtime_log(
+                f"Transcribing with BatchedInferencePipeline (batch_size={BATCH_SIZE}, "
+                f"vad_threshold={_ASMR_VAD_PARAMETERS['threshold']})"
+            )
+            uiwrapper.update_percentagelabel_post("text", "Transcribing (batched)...")
             segments, _info = pipeline.transcribe(
                 file,
                 batch_size=BATCH_SIZE,
@@ -310,16 +322,23 @@ def _fw_transcribe(model, file, uiwrapper, use_gpu):
                 language=src_lang,
                 vad_parameters=_ASMR_VAD_PARAMETERS,
             )
-            append_runtime_log(
-                f"Transcribing with BatchedInferencePipeline (batch_size={BATCH_SIZE}, "
-                f"vad_threshold={_ASMR_VAD_PARAMETERS['threshold']})"
-            )
-            return segments
+            # pipeline.transcribe() returns a LAZY generator: the actual GPU
+            # decoding (and any CUDA OOM) only happens while iterating. Drain
+            # it here, inside the try, so a decode failure really does fall
+            # back to sequential decoding instead of escaping to the caller's
+            # SRT-writing loop with no fallback at all.
+            return list(segments)
         except Exception as exc:
             append_runtime_log(
-                f"Batched pipeline unavailable ({type(exc).__name__}: {exc}); "
+                f"Batched pipeline failed ({type(exc).__name__}: {exc}); "
                 f"falling back to sequential decoding"
             )
+            uiwrapper.update_percentagelabel_post("text", "Batched failed; sequential decoding...")
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     segments, _info = model.transcribe(
         file,

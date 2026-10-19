@@ -41,6 +41,7 @@ _MAX_NEW_TOKENS = 448
 
 _model = None
 _processor = None
+_loaded_on_gpu = None  # effective device the cached model lives on
 
 
 def append_runtime_log(message):
@@ -51,17 +52,49 @@ def append_runtime_log(message):
         log_file.write(f"[{timestamp}] {message}\n")
 
 
-def _lazy_load():
-    """Load (and cache) the Qwen3-ASR model + processor on first use."""
-    global _model, _processor
-    if _model is None:
+def unload():
+    """Free the cached model so its ~3.5GB of VRAM is returned, instead of
+    staying resident for the life of the process. Called at batch end and
+    whenever the requested device (Cuda checkbox) changes."""
+    global _model, _processor, _loaded_on_gpu
+    if _model is None and _processor is None:
+        return
+    _model = None
+    _processor = None
+    _loaded_on_gpu = None
+    import gc
+    gc.collect()
+    try:
         import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    append_runtime_log("Qwen3-ASR model unloaded")
+
+
+def _lazy_load(use_gpu):
+    """Load (and cache) the Qwen3-ASR model + processor on first use,
+    honouring the Cuda checkbox: fp16 on GPU, fp32 on CPU (fp16 CPU matmuls
+    are pathologically slow). Reloads if the device choice changes."""
+    global _model, _processor, _loaded_on_gpu
+    import torch
+    gpu = bool(use_gpu) and torch.cuda.is_available()
+    if _model is not None and _loaded_on_gpu != gpu:
+        unload()
+    if _model is None:
         from transformers import AutoProcessor, AutoModelForMultimodalLM
-        append_runtime_log(f"Qwen3-ASR loading {MODEL_ID} ...")
+        append_runtime_log(f"Qwen3-ASR loading {MODEL_ID} on {'cuda' if gpu else 'cpu'} ...")
         _processor = AutoProcessor.from_pretrained(MODEL_ID)
-        _model = AutoModelForMultimodalLM.from_pretrained(
-            MODEL_ID, device_map="auto", dtype=torch.float16
-        )
+        if gpu:
+            _model = AutoModelForMultimodalLM.from_pretrained(
+                MODEL_ID, device_map="auto", dtype=torch.float16
+            )
+        else:
+            _model = AutoModelForMultimodalLM.from_pretrained(
+                MODEL_ID, dtype=torch.float32
+            ).to("cpu")
+        _loaded_on_gpu = gpu
         append_runtime_log("Qwen3-ASR model ready")
     return _model, _processor
 
@@ -96,7 +129,13 @@ def transcribe_qwen(wav_path, uiwrapper):
     import librosa
     from faster_whisper.vad import get_speech_timestamps, VadOptions
 
-    model, processor = _lazy_load()
+    use_gpu = True
+    if hasattr(uiwrapper, "get_cuda_var"):
+        try:
+            use_gpu = bool(uiwrapper.get_cuda_var())
+        except Exception:
+            pass
+    model, processor = _lazy_load(use_gpu)
 
     audio, sr = librosa.load(wav_path, sr=_TARGET_SR, mono=True)  # float32 in [-1, 1]
     speech_ts = get_speech_timestamps(audio, VadOptions(**_VAD_OPTIONS), sampling_rate=sr)

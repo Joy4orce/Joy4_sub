@@ -229,21 +229,35 @@ def _build_env(uiwrapper, plan):
 
 
 def _run_claude_once(prompt, env):
-    """Execute claude.exe a single time with the given env, returning the CompletedProcess."""
+    """Execute claude once with the given env, returning the CompletedProcess.
+
+    The prompt (which contains untrusted transcribed subtitle text) is fed via
+    STDIN, never placed on the command line. Putting it in argv with
+    shell=True let cmd.exe interpret quotes/&/|/% inside the subtitles —
+    i.e. command injection from audio content — and also tripped cmd.exe's
+    8191-char limit on large batches. `claude -p` reads the prompt from stdin
+    when no positional prompt is given.
+    """
     claude_exe = _find_claude_exe()
-    use_shell = claude_exe.lower().endswith(('.cmd', '.bat'))
+    if claude_exe.lower().endswith(('.cmd', '.bat')):
+        # npm-installed shim: run it through cmd.exe explicitly (shell=False),
+        # so only the fixed, trusted path is on the command line.
+        args = ["cmd.exe", "/c", claude_exe, "-p"]
+    else:
+        args = [claude_exe, "-p"]
     kwargs = {
+        "input": prompt,
         "capture_output": True,
         "text": True,
         "encoding": "utf-8",
         "errors": "replace",
         "timeout": 600,
-        "shell": use_shell,
+        "shell": False,
         "env": env,
     }
-    if sys.platform == "win32" and not use_shell:
+    if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-    return subprocess.run([claude_exe, "-p", prompt], **kwargs)
+    return subprocess.run(args, **kwargs)
 
 
 def translateusingclaude(text, uiwrapper, _plan=None, _exhausted=None):
